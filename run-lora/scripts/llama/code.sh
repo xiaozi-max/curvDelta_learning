@@ -1,6 +1,7 @@
 #!/bin/bash
 
 source "$(git rev-parse --show-toplevel)/common_utils/server_env.sh"
+set -e
 
 ### Yon can uncomment these lines to set HF cache and token globally
 # export HF_HOME=/your/HuggingFace/cahce # Will be used to save HugginFace download model
