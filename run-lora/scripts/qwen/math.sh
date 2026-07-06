@@ -1,5 +1,7 @@
 #!/bin/bash
 
+source "$(git rev-parse --show-toplevel)/common_utils/server_env.sh"
+
 ### Yon can uncomment these lines to set HF cache and token globally
 # export HF_HOME=/your/HuggingFace/cahce # Will be used to save HugginFace download model
 # export HF_TOKEN= ## PLEASE ADD YOUR HF TOKEN HERE ##
@@ -26,7 +28,7 @@ output_home="./"
 master_port=16925  # Change this if running multiple DeepSpeed jobs on the same node
 
 # Model configuration
-model="Qwen/Qwen3-0.6B-Base"
+model="${ROOT_DIR}/models/Qwen/Qwen3-0.6B-Base"
 model_abbr="qwen-3-0.6b"
 
 # GPU allocation

@@ -1,8 +1,10 @@
 #!/bin/bash
 
+source "$(git rev-parse --show-toplevel)/common_utils/server_env.sh"
+
 # Default values
 CUDA_DEVICES="0,1"
-MODEL="Qwen/Qwen3-0.6B-Base"
+MODEL="${ROOT_DIR}/models/Qwen/Qwen3-0.6B-Base"
 DATA_PATH="../run-lora/lora-dataset/pissa-dataset/metamath/train.json"
 DATA_FIELD="instruction,output"
 SCAN_MODULES="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
@@ -59,6 +61,6 @@ python3 lanczos.py \
     --b $SAMPLES \
     --model_input_bs $MODEL_INPUT_BS \
     --max_iter $ITER \
-    --peft "$PEFT" \                           
+    --peft "$PEFT" \
     --rank $RANK \
     --tol $TOL
