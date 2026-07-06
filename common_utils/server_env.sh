@@ -44,9 +44,6 @@ export DEFAULT_GPU_IDS
 export DEFAULT_MAX_PROC
 
 # ── Common environment variables ─────────────────────────────────────────────
-# export HF_ENDPOINT="https://alpha.hf-mirror.com"
-export HF_TOKEN="${HF_TOKEN:-}"
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_BASE_URL="https://api.bandw.top"
 
 LOCAL_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
