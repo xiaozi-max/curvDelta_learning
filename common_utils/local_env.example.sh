@@ -5,4 +5,3 @@
 
 export HF_TOKEN=""
 export WANDB_API_KEY=""
-export WANDB_BASE_URL="https://api.bandw.top"
