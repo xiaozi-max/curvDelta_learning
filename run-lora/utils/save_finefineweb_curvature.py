@@ -31,8 +31,6 @@ def default_output_path(dataset: str, num_samples: int, seed: int) -> Path:
 
 def main():
     args = parse_args()
-    if args.num_samples <= 0:
-        raise ValueError("--num_samples must be positive.")
 
     output_path = Path(args.output_path) if args.output_path else default_output_path(args.dataset, args.num_samples, args.seed)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,14 +40,10 @@ def main():
         for file_name in list_repo_files(args.dataset, repo_type="dataset")
         if file_name.endswith(".jsonl")
     )
-    if not data_files:
-        raise ValueError(f"No JSONL files found in dataset {args.dataset!r}.")
 
     dataset = load_dataset(args.dataset, data_files=data_files, split="train")
     dataset = dataset.filter(lambda row: isinstance(row.get("text"), str) and bool(row["text"].strip()))
     dataset = dataset.shuffle(seed=args.seed)
-    if len(dataset) < args.num_samples:
-        raise ValueError(f"Requested {args.num_samples} samples, but only {len(dataset)} non-empty records are available.")
     dataset = dataset.select(range(args.num_samples))
 
     with output_path.open("w", encoding="utf-8") as f:
