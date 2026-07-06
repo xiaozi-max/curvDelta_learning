@@ -47,7 +47,7 @@ export DEFAULT_MAX_PROC
 # export HF_ENDPOINT="https://alpha.hf-mirror.com"
 export HF_TOKEN="${HF_TOKEN:-}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
-export WANDB_BASE_URL="https://api.bandw.top"
+export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
 # ── GPU grabber ───────────────────────────────────────────────────────────────
 # Usage: grab_gpus [N=1] [MEM_MB=30000] [MAX_UTIL=10] [MAX_PROC=2] [GPU_IDS="$DEFAULT_GPU_IDS"] [WAIT_SEC=60]
