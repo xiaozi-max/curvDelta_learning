@@ -47,7 +47,7 @@ export DEFAULT_MAX_PROC
 # export HF_ENDPOINT="https://alpha.hf-mirror.com"
 export HF_TOKEN="${HF_TOKEN:-}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
-export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
+export WANDB_BASE_URL="https://api.bandw.top"
 
 LOCAL_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
 if [[ -f "${LOCAL_ENV}" ]]; then
