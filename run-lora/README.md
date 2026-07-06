@@ -88,9 +88,11 @@ run-lora/
 │   ├── init_pissa.py     # PiSSA init
 │   ├── init_milora.py    # MiLoRA init
 │   ├── init_AB_util.py   # InitAB init
-│   ├── gen_vllm_lora.py  # vLLM generation for model testing
-│   ├── test_acc.py       # accuracy scoring (math / commonsense / IFEval)
-│   └── code_process.py   # code scoring (HumanEval / MBPP via evalplus)
+│   ├── curvature_lora.py             # CurvatureLoRA forward, KFAC collection, and folding
+│   ├── save_finefineweb_curvature.py # FineFineWeb-validation curvature anchor preprocessing
+│   ├── gen_vllm_lora.py              # vLLM generation for model testing
+│   ├── test_acc.py                   # accuracy scoring (math / commonsense / IFEval)
+│   └── code_process.py               # code scoring (HumanEval / MBPP via evalplus)
 │   
 ├── exp_record/
 │   ├── get_record.py     # scan output/ → ./json/{model}/{task}/results.json
@@ -121,6 +123,12 @@ We use the preprocessed datasets released by the PiSSA authors (see the [Hugging
 huggingface-cli download --repo-type dataset --resume-download fxmeng/pissa-dataset \
     --include "metamath/*" "python/*" \
     --local-dir ./lora-dataset/pissa-dataset
+```
+
+CurvatureLoRA also needs a raw-text curvature anchor set. The default path expected by `scripts/train.sh` is `./lora-dataset/curvature/finefineweb_validation_16384_seed42.jsonl`:
+
+```bash
+python utils/save_finefineweb_curvature.py
 ```
 
 ### *2. Commonsense Reasoning*

@@ -15,6 +15,7 @@ import datasets
 import numpy as np
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel, LoraRuntimeConfig
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+from utils.curvature_lora import CurvatureTrainer, apply_curvature_lora
 
 IGNORE_INDEX = -100
 logger = logging.getLogger(__name__)
@@ -67,6 +68,12 @@ class TrainingArguments(transformers.TrainingArguments):
     randlora_alpha: int = field(default=None, metadata={"help": "the alpha hyperparameter of RandLoRA \
                                 typically 20 times the rank of the random bases. \
                                 https://github.com/huggingface/peft/blob/758cdac51922abbb24b6e772844c0a88bbe1cd7d/src/peft/tuners/randlora/config.py#L140"})
+    ## CurvatureLoRA
+    use_curvature_lora: Optional[bool] = field(default=False)
+    curvature_data_path: Optional[str] = field(default=None, metadata={"help": "Path to raw-text JSONL curvature anchor set."})
+    curvature_energy_ratio: float = field(default=0.9, metadata={"help": "KFAC top-eigenvector energy ratio for CurvatureLoRA projections."})
+    curvature_collection_batch_size: int = field(default=1, metadata={"help": "Per-device batch size for CurvatureLoRA KFAC/Fisher collection."})
+    curvature_num_chunks: int = field(default=1, metadata={"help": "Number of target-module chunks for CurvatureLoRA KFAC collection."})
         
     # LoRA setting
     target_modules : Optional[str] = field(default="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj")
@@ -288,6 +295,9 @@ def build_model(script_args, checkpoint_dir):
 
             model = get_peft_model(model, peft_config)
 
+            if script_args.use_curvature_lora:
+                model = apply_curvature_lora(model)
+
             if script_args.use_olora:
                 olora_residual_path = os.path.join(script_args.output_dir, "olora_residual_model")
                 model_copy = copy.deepcopy(model)
@@ -354,6 +364,13 @@ def train():
         logger.info("Load tokenizer from {} over.".format(script_args.model_name_or_path))
 
     resume_from_checkpoint_dir = get_last_checkpoint(script_args.output_dir)
+    if script_args.use_curvature_lora:
+        if resume_from_checkpoint_dir is not None:
+            raise ValueError("CurvatureLoRA does not support resuming from unfinished checkpoints.")
+        if script_args.curvature_data_path is None:
+            raise ValueError("--curvature_data_path is required when --use_curvature_lora True.")
+        if str(script_args.save_strategy).lower().split(".")[-1] != "no":
+            raise ValueError("CurvatureLoRA requires --save_strategy no; only the final folded adapter is saved.")
     model = build_model(script_args, resume_from_checkpoint_dir)
 
     all_training_dataset = []
@@ -411,7 +428,20 @@ def train():
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     data_module = dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
-    if script_args.use_loft:
+    if script_args.use_curvature_lora:
+        if script_args.use_loft:
+            raise ValueError("CurvatureLoRA cannot be combined with LoFT optimizer mode.")
+        trainer = CurvatureTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            args=script_args,
+            curvature_data_path=script_args.curvature_data_path,
+            curvature_energy_ratio=script_args.curvature_energy_ratio,
+            curvature_collection_batch_size=script_args.curvature_collection_batch_size,
+            curvature_num_chunks=script_args.curvature_num_chunks,
+            **data_module,
+        )
+    elif script_args.use_loft:
         from utils.LoFT.utils import get_optimizer
         optimizer = get_optimizer(model, lr=script_args.learning_rate, LoFT=True)
         loft_max_norm = script_args.max_grad_norm if script_args.max_grad_norm is not None else 1.0
@@ -425,7 +455,6 @@ def train():
     #     trainer = Trainer(model=model, processing_class=tokenizer, args=script_args, **data_module)
     else:
         trainer = Trainer(model=model, tokenizer=tokenizer, args=script_args, **data_module)
-
     if not script_args.full_finetune:
         trainer.add_callback(SavePeftModelCallback(tokenizer))
     trainer.train(resume_from_checkpoint=resume_from_checkpoint_dir)
