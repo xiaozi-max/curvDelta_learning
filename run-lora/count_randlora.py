@@ -1,3 +1,4 @@
+import os
 import torch
 import gc
 from transformers import AutoModelForCausalLM
@@ -6,7 +7,10 @@ from peft import LoraConfig, get_peft_model, TaskType
 from peft import RandLoraConfig
 
 
-MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
+ROOT_DIR = os.environ.get("ROOT_DIR")
+if ROOT_DIR is None:
+    raise RuntimeError("Please source common_utils/server_env.sh before running this script.")
+MODEL_NAME = os.path.join(ROOT_DIR, "models", "Qwen", "Qwen3-0.6B-Base")
 
 TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
@@ -105,7 +109,7 @@ if __name__ == "__main__":
 
 
 '''
-Model: Qwen/Qwen3-0.6B-Base
+Model: ${ROOT_DIR}/models/Qwen/Qwen3-0.6B-Base
 
 ======================================================================
 LoRA rank=128

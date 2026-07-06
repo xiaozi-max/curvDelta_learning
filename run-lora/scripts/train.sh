@@ -1,9 +1,11 @@
 #!/bin/bash
 
+source "$(git rev-parse --show-toplevel)/common_utils/server_env.sh"
+
 # =====================
 # default values
 # =====================
-model="meta-llama/Llama-2-7b-hf"   # model name
+model="${ROOT_DIR}/models/meta-llama/Llama-2-7b-hf"   # model path
 model_abbr="Llama-2-7b"            # model name abbr
 data="pissa-dataset"               # data path
 task="metamath"                    # task name
