@@ -53,13 +53,14 @@ tasks=("python") # Task to fine-tune.
 ### Use the "-epY" postfix to train for Y epochs; default is 1
 
 
-peft_methods=("LoRA" "PiSSA" "MiLoRA" "InitAB" "DoRA") # assign the PEFT methods you would like to run
+peft_methods=("LoRA" "CurvatureLoRA" "PiSSA" "MiLoRA" "InitAB" "DoRA") # assign the PEFT methods you would like to run
 # ("LoRA-GA" "GraLoRA") # use custom conda enviroments to run these two PEFT methods per instruction in README
 # ("RandLoRA") # assign custom LoRA rank to match its trainable parameter counts to other PEFT methods
 
 ## You can specify the learning rate search range for each PEFT method:
 declare -A peft_lrs  
 peft_lrs["LoRA"]="1.1247e-5 2.0000e-5 3.5566e-5 6.3246e-5 1.1247e-4 2.0000e-4 3.5566e-4 6.3246e-4 1.1247e-3 2.0000e-3 3.5566e-3 6.3246e-3"
+peft_lrs["CurvatureLoRA"]="1.1247e-5 2.0000e-5 3.5566e-5 6.3246e-5 1.1247e-4 2.0000e-4 3.5566e-4 6.3246e-4 1.1247e-3 2.0000e-3 3.5566e-3 6.3246e-3"
 peft_lrs["OLoRA"]="1.1247e-5 2.0000e-5 3.5566e-5 6.3246e-5 1.1247e-4 2.0000e-4 3.5566e-4 6.3246e-4 1.1247e-3 2.0000e-3 3.5566e-3 6.3246e-3"
 peft_lrs["PiSSA"]="1.1247e-5 2.0000e-5 3.5566e-5 6.3246e-5 1.1247e-4 2.0000e-4 3.5566e-4 6.3246e-4 1.1247e-3 2.0000e-3 3.5566e-3 6.3246e-3"
 peft_lrs["MiLoRA"]="1.1247e-5 2.0000e-5 3.5566e-5 6.3246e-5 1.1247e-4 2.0000e-4 3.5566e-4 6.3246e-4 1.1247e-3 2.0000e-3 3.5566e-3 6.3246e-3"

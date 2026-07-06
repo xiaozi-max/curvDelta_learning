@@ -34,7 +34,7 @@ Options:
                        instruction→ local dir containing IFEval/input_data.jsonl
                      (default: $data_path)
   --task NAME        Task name: metamath, python, commonsense, instruction (default: "$task")
-  --peft NAME        PEFT method: LoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
+  --peft NAME        PEFT method: LoRA, CurvatureLoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
   --rank INT         LoRA rank (default: $rank)
   --bs INT           Inference batch size (default: $bs)
   --output_home PATH Reroute the whole "output" folder to other place (default: $output_home)
@@ -87,8 +87,8 @@ fi
 if [[ ! -d "$output_path" ]]; then
   echo "Error: output_path does not exist: $output_path" >&2; exit 1
 fi
-if [[ ! "$peft" =~ ^(LoRA|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
-  echo "Error: --peft must be one of {LoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
+if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
+  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
   exit 2
 fi
 
@@ -136,7 +136,7 @@ elif [[ "$peft" == "LoRA-GA" ]]; then
   base_model=$(readlink -m "${output_home}/output/LoRA-GA-${model_abbr}-r${rank}-${task}")
   W
 else
-  # LoRA, DoRA, GraLoRA, LoFT — base model with standard adapter
+  # LoRA, CurvatureLoRA, DoRA, GraLoRA, LoFT — base model with standard adapter
   base_model="$model"
 fi
 

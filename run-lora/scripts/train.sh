@@ -9,7 +9,7 @@ model="${ROOT_DIR}/models/meta-llama/Llama-2-7b-hf"   # model path
 model_abbr="Llama-2-7b"            # model name abbr
 data="pissa-dataset"               # data path
 task="metamath"                    # task name
-peft="LoRA"                        # peft method: LoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT
+peft="LoRA"                        # peft method: LoRA, CurvatureLoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT
 rank=128                           # lora rank
 lr=2e-5                            # learning rate
 bs=128                             # total (global) batch size you want to simulate
@@ -23,6 +23,7 @@ output_home="./"                   # reroute the whole "output" folder to other 
 output_path=""                     # the path to save exp results
 gralora_k=2                        # GraLoRA k parameter
 randlora_alpha=640.0               # RandLoRA alpha parameter
+curvature_data_path="./lora-dataset/curvature/finefineweb_validation_16384_seed42.jsonl"  # CurvatureLoRA anchor JSONL
 
 # =====================
 # help function
@@ -36,7 +37,7 @@ Options:
   --model_abbr NAME  Model abbreviation name (default: $model_abbr)
   --data PATH        Data path (default: $data)
   --task NAME        Task name, e.g., metamath, python, conversation (default: "$task")
-  --peft NAME        PEFT method: LoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
+  --peft NAME        PEFT method: LoRA, CurvatureLoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
   --rank INT         LoRA rank (default: $rank)
   --lr FLOAT         Learning rate (default: $lr)
   --bs INT           Global batch size (default: $bs)
@@ -50,6 +51,7 @@ Options:
   --output_path PATH Specific output path for experiment results (default: auto-generated)
   --gralora_k INT    GraLoRA k parameter (default: $gralora_k)
   --randlora_alpha FLOAT  RandLoRA alpha parameter (default: $randlora_alpha)
+  --curvature_data_path PATH  CurvatureLoRA anchor JSONL (default: $curvature_data_path)
   --help             Show this help message and exit
 EOF
 }
@@ -58,7 +60,7 @@ EOF
 # parse long options
 # =====================
 TEMP=$(getopt -o '' \
-  --long model:,model_abbr:,data:,task:,peft:,rank:,lr:,bs:,per_bs:,model_max_length:,gpus:,trial_id:,master_port:,timestamp:,output_home:,output_path:,gralora_k:,randlora_alpha:,help \
+  --long model:,model_abbr:,data:,task:,peft:,rank:,lr:,bs:,per_bs:,model_max_length:,gpus:,trial_id:,master_port:,timestamp:,output_home:,output_path:,gralora_k:,randlora_alpha:,curvature_data_path:,help \
   -n "$0" -- "$@")
 if [ $? != 0 ]; then
     echo "Error parsing options." >&2
@@ -85,6 +87,7 @@ while true; do
     --output_path)  output_path="$2"; shift 2 ;;
     --gralora_k)    gralora_k="$2"; shift 2 ;;
     --randlora_alpha) randlora_alpha="$2"; shift 2 ;;
+    --curvature_data_path) curvature_data_path="$2"; shift 2 ;;
     --help)         show_help; exit 0 ;;
     --) shift; break ;;
     *) echo "Internal error!"; exit 1 ;;
@@ -94,8 +97,8 @@ done
 # =====================
 # validations (types & allowed sets)
 # =====================
-if [[ ! "$peft" =~ ^(LoRA|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
-  echo "Error: --peft must be one of {LoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
+if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
+  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
   exit 2
 fi
 if [[ ! "$rank" =~ ^[0-9]+$ ]]; then
@@ -218,6 +221,9 @@ echo "GPUs: $gpus (world_size=$world_size)"
 echo "Grad Accum Steps: $gradient_accumulation_steps"
 echo "TOTAL_BATCH_SIZE (effective): $eff_bs"
 echo "Output Path: $output_path"
+if [[ "$peft" == "CurvatureLoRA" ]]; then
+  echo "Curvature Data Path: $curvature_data_path"
+fi
 echo "Time stamp: $timestamp"
 echo "Trial ID: $trial_id"
 echo "================================"
@@ -311,6 +317,40 @@ elif [[ "$peft" == "MiLoRA" ]]; then
 
 elif [[ "$peft" == "LoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
+    --deepspeed configs/ds_config_zero2_no_offload.json \
+    --model_name_or_path "$model" \
+    --full_finetune False \
+    --bf16 \
+    --init_weights True \
+    --target_modules "q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj" \
+    --lora_rank "$rank" \
+    --lora_alpha "$rank" \
+    --lora_dropout 0 \
+    --data_path "$data" \
+    --sub_task "$task" \
+    --dataset_split train \
+    --dataset_field instruction output \
+    --output_dir "$output_path" \
+    --num_train_epochs "$num_train_epochs" \
+    --model_max_length "$model_max_length" \
+    --per_device_train_batch_size "$per_bs" \
+    --gradient_accumulation_steps "$gradient_accumulation_steps" \
+    --learning_rate "$lr" \
+    --save_strategy "no" \
+    --weight_decay 0.0 \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --report_to "wandb" \
+    --trial_id $trial_id \
+    --logging_steps 1
+
+elif [[ "$peft" == "CurvatureLoRA" ]]; then
+  deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
+    --use_curvature_lora True \
+    --curvature_data_path "$curvature_data_path" \
+    --curvature_energy_ratio 0.9 \
+    --curvature_collection_batch_size 1 \
+    --curvature_num_chunks 1 \
     --deepspeed configs/ds_config_zero2_no_offload.json \
     --model_name_or_path "$model" \
     --full_finetune False \
@@ -569,6 +609,6 @@ elif [[ "$peft" == "LoFT" ]]; then
 
 else
   echo "Error: Unsupported PEFT method: $peft" >&2
-  echo "Supported methods: LoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT" >&2
+  echo "Supported methods: LoRA, CurvatureLoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT" >&2
   exit 1
 fi
