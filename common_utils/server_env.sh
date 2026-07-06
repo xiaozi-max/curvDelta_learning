@@ -49,6 +49,12 @@ export HF_TOKEN="${HF_TOKEN:-}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
+LOCAL_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
+if [[ -f "${LOCAL_ENV}" ]]; then
+    source "${LOCAL_ENV}"
+fi
+unset LOCAL_ENV
+
 # ── GPU grabber ───────────────────────────────────────────────────────────────
 # Usage: grab_gpus [N=1] [MEM_MB=30000] [MAX_UTIL=10] [MAX_PROC=2] [GPU_IDS="$DEFAULT_GPU_IDS"] [WAIT_SEC=60]
 # Sets and exports CUDA_VISIBLE_DEVICES once N qualifying GPUs are found.

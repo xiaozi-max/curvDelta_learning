@@ -4,3 +4,4 @@ run-lora/wandb/
 __pycache__
 future_versioin_note.md
 .vscode/*
+common_utils/local_env.sh
