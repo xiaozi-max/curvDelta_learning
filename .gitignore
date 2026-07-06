@@ -3,3 +3,4 @@ run-lora/output*/
 run-lora/wandb/
 __pycache__
 future_versioin_note.md
+.vscode/*
