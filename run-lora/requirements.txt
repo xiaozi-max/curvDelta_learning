@@ -17,3 +17,4 @@ torch==2.7.1
 tqdm==4.67.1
 transformers==4.56.0
 vllm==0.10.1.1
+wandb
