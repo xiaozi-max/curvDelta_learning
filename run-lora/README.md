@@ -107,6 +107,12 @@ All commands below assume you are running from the `run-lora` directory:
 cd run-lora
 ```
 
+You can download all datasets with:
+
+```bash
+bash ./scripts/download_datasets.sh
+```
+
 ### *1. Mathematical Reasoning and Code Generation*
 
 We use the preprocessed datasets released by the PiSSA authors (see the [HuggingFace page](https://huggingface.co/datasets/fxmeng/pissa-dataset)):
@@ -567,7 +573,6 @@ We document the known sources below; feel free to open issues to help us keep th
 
 ## Known Issues
 Please feel free to open issues to report errors or package impatibility you faced.
-
 
 
 
