@@ -63,8 +63,8 @@ class CurvatureLora(LoraVariant):
         U_in_bar = U_in_bar.to(dtype=compute_dtype)
         U_out_bar = U_out_bar.to(dtype=compute_dtype)
 
-        A_eff = weight_A - (weight_A @ U_in_bar) @ U_in_bar.T if U_in_bar.shape[1] > 0 else weight_A
-        B_eff = weight_B - U_out_bar @ (U_out_bar.T @ weight_B) if U_out_bar.shape[1] > 0 else weight_B
+        A_eff = weight_A - (weight_A @ U_in_bar) @ U_in_bar.T
+        B_eff = weight_B - U_out_bar @ (U_out_bar.T @ weight_B)
 
         x_in = dropout(x)
         if x_in.dtype != compute_dtype:
