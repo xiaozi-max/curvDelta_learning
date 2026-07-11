@@ -37,62 +37,87 @@ for seed in "${seeds[@]}"; do
     echo ">>> Experiment output path: $output_path"
     echo ">>> Temp merged model save path: $temp_path"
 
+    perf_exists=false
     if [[ -f "$perf_json_path" ]] \
       && grep -E '[0-9]+\.?[0-9]*' "$perf_json_path" >/dev/null; then
-      echo "✓ perf.json exists and contains numbers"
-      echo "Skip this experiment"
-      continue
+      echo "✓ perf.json already exists"
+      perf_exists=true
     fi
 
-    if [[ -d "$adapter_path" ]]; then
-      echo ">>> Skipping: adapter_model already exists: $adapter_path"
-    else
-      echo ">>> Start Training, adapters will be saved at $adapter_path"
-      bash ./scripts/train.sh \
-        --data "$data" \
-        --master_port "$master_port" \
+    if [[ "$perf_exists" == false ]]; then
+      if [[ -d "$adapter_path" ]]; then
+        echo ">>> Skipping: adapter_model already exists: $adapter_path"
+      else
+        echo ">>> Start Training, adapters will be saved at $adapter_path"
+        bash ./scripts/train.sh \
+          --data "$data" \
+          --master_port "$master_port" \
+          --model "$model" \
+          --model_abbr "$model_abbr" \
+          --output_path "$output_path" \
+          --task "$task" \
+          --peft "$peft" \
+          --rank "$rank" \
+          --gpus "$train_gpus" \
+          --trial_id "$seed" \
+          --lr "$lr" \
+          --bs "$bs" \
+          --model_max_length "$model_max_length" \
+          --timestamp "$timestamp" \
+          --per_bs "$per_bs" \
+          --output_home "$output_home"
+      fi
+
+      echo ">>> Start Testing, performance will be saved at $perf_json_path"
+      bash ./scripts/test.sh \
         --model "$model" \
+        --data_path "$data" \
         --model_abbr "$model_abbr" \
-        --output_path "$output_path" \
         --task "$task" \
         --peft "$peft" \
         --rank "$rank" \
-        --gpus "$train_gpus" \
-        --trial_id "$seed" \
-        --lr "$lr" \
-        --bs "$bs" \
-        --model_max_length "$model_max_length" \
-        --timestamp "$timestamp" \
-        --per_bs "$per_bs" \
-        --output_home "$output_home"
+        --bs "$inference_bs" \
+        --gpus "$test_gpus" \
+        --output_home "$output_home" \
+        --output_path "$output_path" \
+        --temp_path "$temp_path" \
+        --timestamp "$timestamp"
+
+      if [[ -d "$temp_path" ]]; then
+        rm -rf "$temp_path"
+        echo "✓ Successfully deleted: $temp_path"
+      else
+        echo "✗ Directory not found: $temp_path"
+        echo "  The merged model may already have been deleted by Python."
+      fi
     fi
 
-    echo ">>> Start Testing, performance will be saved at $perf_json_path"
-    bash ./scripts/test.sh \
-      --model "$model" \
-      --data_path "$data" \
-      --model_abbr "$model_abbr" \
-      --task "$task" \
-      --peft "$peft" \
-      --rank "$rank" \
-      --bs "$inference_bs" \
-      --gpus "$test_gpus" \
-      --output_home "$output_home" \
-      --output_path "$output_path" \
-      --temp_path "$temp_path" \
-      --timestamp "$timestamp"
-
-    if [[ -d "$temp_path" ]]; then
-      rm -rf "$temp_path"
-      echo "✓ Successfully deleted: $temp_path"
-    else
-      echo "✗ Directory not found: $temp_path"
-      echo "  The merged model may already have been deleted by Python."
-    fi
-
+    # Re-check perf.json after possible test run
     if [[ -f "$perf_json_path" ]] \
       && grep -E '[0-9]+\.?[0-9]*' "$perf_json_path" >/dev/null; then
       echo "✓ perf.json exists and contains numbers"
+      if [[ "${run_world_knowledge:-false}" == "true" ]]; then
+        wk_file="${output_path}/world_knowledge.json"
+        if [[ -f "$wk_file" ]]; then
+          echo "✓ world_knowledge.json exists, skipping world knowledge eval"
+        else
+          echo ">>> Start World Knowledge Evaluation"
+          wk_gpu=$(echo "$CUDA_VISIBLE_DEVICES" | cut -d',' -f1)
+          python utils/eval_world_knowledge.py \
+            --model "$model" \
+            --model_abbr "$model_abbr" \
+            --lora "$adapter_path" \
+            --peft "$peft" \
+            --rank "$rank" \
+            --task "$task" \
+            --output_path "$output_path" \
+            --output_home "$output_home" \
+            --gpus "$wk_gpu" \
+            --timestamp "$timestamp" \
+            --batch_size "${world_knowledge_batch_size:-auto}"
+          echo ">>> World Knowledge Evaluation done"
+        fi
+      fi
       if [[ "$delete_adapter_after_test" == true ]]; then
         adapter_dir=$(readlink -m "${output_path}/adapter_model")
         if [[ -d "$adapter_dir" ]]; then
