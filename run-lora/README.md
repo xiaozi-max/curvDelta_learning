@@ -1,18 +1,36 @@
 # Train various LoRA methods with learning rate tuning
 
 ## README Table of Contents
-- [Environment Setup](#environment-setup)
-  - [1. Main Environment](#1-main-environment)
-  - [2. LoRA-GA Environment](#2-lora-ga-environment)
-  - [3. GraLoRA Environment](#3-gralora-environment)
-- [Code Strucutre](#code-structure)
-- [Download Fine-tuning Datasets](#download-fine-tuning-datasets)
-  - [1. Mathematical Reasoning and Code Generation](#1-mathematical-reasoning-and-code-generation)
-  - [2. Commonsense Reasoning](#2-commonsense-reasoning)
-  - [3. Instruction Following](#3-instruction-following)
-- [Run Learning Rate Tuning](#run-learning-rate-tuning)
-- [On Reproducibility](#on-reproducibility)
-- [Known Issues](#known-issues)
+- [Train various LoRA methods with learning rate tuning](#train-various-lora-methods-with-learning-rate-tuning)
+  - [README Table of Contents](#readme-table-of-contents)
+  - [Environment Setup](#environment-setup)
+    - [*1. Main Environment*](#1-main-environment)
+    - [*2. LoRA-GA Environment*](#2-lora-ga-environment)
+    - [*3. GraLoRA Environment*](#3-gralora-environment)
+  - [Code Structure](#code-structure)
+  - [Download Fine-tuning Datasets](#download-fine-tuning-datasets)
+    - [*1. Mathematical Reasoning and Code Generation*](#1-mathematical-reasoning-and-code-generation)
+    - [*2. Commonsense Reasoning*](#2-commonsense-reasoning)
+      - [Training dataset](#training-dataset)
+      - [Testing dataset](#testing-dataset)
+    - [*3. Instruction Following*](#3-instruction-following)
+      - [Training dataset](#training-dataset-1)
+      - [Testing dataset](#testing-dataset-1)
+  - [Run Learning Rate Tuning](#run-learning-rate-tuning)
+    - [*1. Qwen3-0.6B on MetaMath (i.e., results reported in paper Figure 1)*](#1-qwen3-06b-on-metamath-ie-results-reported-in-paper-figure-1)
+    - [*2. Aggregate Results*](#2-aggregate-results)
+      - [*2.1. Collect all hyperparameter search results into a JSON file*](#21-collect-all-hyperparameter-search-results-into-a-json-file)
+      - [*2.2 Show structured output in the terminal*](#22-show-structured-output-in-the-terminal)
+    - [3. Run other model-task combinations or training setup](#3-run-other-model-task-combinations-or-training-setup)
+  - [On Reproducibility](#on-reproducibility)
+    - [Seeding](#seeding)
+    - [Sources of Randomness](#sources-of-randomness)
+      - [1. Numerical Precision](#1-numerical-precision)
+      - [2. During Training](#2-during-training)
+      - [2.1 LoRA Weight Initialization](#21-lora-weight-initialization)
+      - [2.2. PEFT Version Sensitivity](#22-peft-version-sensitivity)
+      - [3. During Inference](#3-during-inference)
+  - [Known Issues](#known-issues)
 
 ## Environment Setup
 
@@ -90,6 +108,8 @@ run-lora/
 │   ├── init_AB_util.py   # InitAB init
 │   ├── curvature_lora.py             # CurvatureLoRA forward, KFAC collection, and folding
 │   ├── save_finefineweb.py           # FineFineWeb-validation curvature anchor preprocessing
+
+│   ├── save_nq_open.py               # NQ-open CorDA-KPM / CurvatureLoRA calibration preprocessing
 │   ├── gen_vllm_lora.py              # vLLM generation for model testing
 │   ├── test_acc.py                   # accuracy scoring (math / commonsense / IFEval)
 │   └── code_process.py               # code scoring (HumanEval / MBPP via evalplus)
@@ -125,11 +145,17 @@ huggingface-cli download --repo-type dataset --resume-download fxmeng/pissa-data
     --local-dir ./lora-dataset/pissa-dataset
 ```
 
-CurvatureLoRA also needs a raw-text curvature anchor set. The default path expected by `scripts/train.sh` is `./lora-dataset/curvature/finefineweb_validation_16384_seed42.jsonl`:
+CorDA (KPM / IPM) and CurvatureLoRA both use FineFineWeb-validation text samples as calibration / KFAC data. The expected files are:
+
+- `./lora-dataset/corda/finefineweb_validation.jsonl` for CorDA calibration (256 samples).
+- `./lora-dataset/curvature/finefineweb_validation_16384_seed42.jsonl` for CurvatureLoRA KFAC collection (16384 samples).
+
+Prepare both with:
 
 ```bash
 python utils/save_finefineweb.py
 ```
+
 
 ### *2. Commonsense Reasoning*
 

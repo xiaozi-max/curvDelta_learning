@@ -74,6 +74,8 @@ class TrainingArguments(transformers.TrainingArguments):
     curvature_energy_ratio: float = field(default=0.9, metadata={"help": "KFAC top-eigenvector energy ratio for CurvatureLoRA projections."})
     curvature_collection_batch_size: int = field(default=1, metadata={"help": "Per-device batch size for CurvatureLoRA KFAC/Fisher collection."})
     curvature_num_chunks: int = field(default=1, metadata={"help": "Number of target-module chunks for CurvatureLoRA KFAC collection."})
+    curvature_alpha_tr: float = field(default=0.0, metadata={"help": "Trust-region alpha: ||Delta W_eff||_F <= alpha_tr * ||W_base||_F. 0 = disabled."})
+    curvature_delta_tr: float = field(default=1e-12, metadata={"help": "Numerical stabilizer for trust-region denominator (must be > 0)."})
         
     # LoRA setting
     target_modules : Optional[str] = field(default="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj")
@@ -439,6 +441,8 @@ def train():
             curvature_energy_ratio=script_args.curvature_energy_ratio,
             curvature_collection_batch_size=script_args.curvature_collection_batch_size,
             curvature_num_chunks=script_args.curvature_num_chunks,
+            curvature_alpha_tr=script_args.curvature_alpha_tr,
+            curvature_delta_tr=script_args.curvature_delta_tr,
             **data_module,
         )
     elif script_args.use_loft:

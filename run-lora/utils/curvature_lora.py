@@ -113,6 +113,32 @@ class CurvatureLora(LoraVariant):
         delta = CurvatureLora._compute_delta_weight(module, active_adapter)
         return orig_weight - delta.to(orig_weight.dtype)
 
+    @staticmethod
+    def effective_delta_weight_norm(module: LoraLayer, active_adapter: str) -> torch.Tensor:
+        """Return ||Delta W_eff||_F (a scalar tensor) computed in float32.
+
+        Delta W_eff = (I - U_out U_out^T) @ B @ A @ (I - U_in U_in^T) * scaling.
+        """
+        U_in_bar = getattr(module, f"U_in_bar_{active_adapter}")
+        U_out_bar = getattr(module, f"U_out_bar_{active_adapter}")
+        weight_A = module.lora_A[active_adapter].weight
+        weight_B = module.lora_B[active_adapter].weight
+        scaling = module.scaling[active_adapter]
+
+        # Compute in float32 for precision
+        weight_A_f = weight_A.float()
+        weight_B_f = weight_B.float()
+        U_in = U_in_bar.float()
+        U_out = U_out_bar.float()
+
+        BA = weight_B_f @ weight_A_f
+        if U_out.shape[1] > 0:
+            BA = BA - U_out @ (U_out.T @ BA)
+        if U_in.shape[1] > 0:
+            BA = BA - (BA @ U_in) @ U_in.T
+        delta = BA * scaling
+        return torch.linalg.vector_norm(delta)
+
 
 def _get_active_adapter(module) -> Optional[str]:
     if hasattr(module, "active_adapters") and module.active_adapters:
@@ -358,12 +384,16 @@ class CurvatureCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         self.trainer.curvature_on_train_begin()
 
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        """Invoked after optimizer.step (only at gradient-accumulation boundaries)."""
+        self.trainer.project_lora_to_relative_trust_region()
+
     def on_train_end(self, args, state, control, **kwargs):
         self.trainer.curvature_on_train_end()
 
 
 class CurvatureTrainerMixin:
-    def __init__(self, *args, curvature_data_path: str, curvature_energy_ratio: float = 0.9, curvature_collection_batch_size: int = 1, curvature_num_chunks: int = 1, **kwargs):
+    def __init__(self, *args, curvature_data_path: str, curvature_energy_ratio: float = 0.9, curvature_collection_batch_size: int = 1, curvature_num_chunks: int = 1, curvature_alpha_tr: float = 0.0, curvature_delta_tr: float = 1e-12, **kwargs):
         if not curvature_data_path:
             raise ValueError("curvature_data_path is required for CurvatureLoRA.")
         if not 0 < float(curvature_energy_ratio) <= 1:
@@ -372,11 +402,17 @@ class CurvatureTrainerMixin:
             raise ValueError(f"curvature_collection_batch_size must be >= 1, got {curvature_collection_batch_size}.")
         if int(curvature_num_chunks) < 1:
             raise ValueError(f"curvature_num_chunks must be >= 1, got {curvature_num_chunks}.")
+        if float(curvature_alpha_tr) < 0:
+            raise ValueError(f"curvature_alpha_tr must be >= 0, got {curvature_alpha_tr}.")
+        if float(curvature_delta_tr) <= 0:
+            raise ValueError(f"curvature_delta_tr must be > 0, got {curvature_delta_tr}.")
 
         self.curvature_data_path = curvature_data_path
         self.curvature_energy_ratio = float(curvature_energy_ratio)
         self.curvature_collection_batch_size = int(curvature_collection_batch_size)
         self.curvature_num_chunks = int(curvature_num_chunks)
+        self.curvature_alpha_tr = float(curvature_alpha_tr)
+        self.curvature_delta_tr = float(curvature_delta_tr)
         self._target_modules: Dict[str, torch.nn.Module] = {}
         self._adapter_names: Dict[str, str] = {}
         self._local_projections: Dict[str, tuple] = {}
@@ -489,6 +525,77 @@ class CurvatureTrainerMixin:
         self._tracker.remove_hooks()
         self._fold_projections_into_lora_weights()
 
+    def project_lora_to_relative_trust_region(self) -> None:
+        """Radially project each CurvatureLoRA effective update into the trust region.
+
+        For each target module, computes
+            c = min(1, alpha_tr * ||W_base||_F / max(||Delta W_eff||_F, delta_tr))
+        and, when c < 1, rescales A <- sqrt(c) * A, B <- sqrt(c) * B under no_grad.
+        alpha_tr == 0 means no projection (identity).
+        """
+        alpha_tr = self.curvature_alpha_tr
+        if alpha_tr <= 0:
+            return
+        delta_tr = self.curvature_delta_tr
+        is_main = self.accelerator.is_main_process
+        projected_layers = 0
+        total_layers = 0
+
+        with torch.no_grad():
+            for name, module in self._target_modules.items():
+                adapter_name = self._adapter_names[name]
+                weight_A = module.lora_A[adapter_name].weight
+                weight_B = module.lora_B[adapter_name].weight
+                base_weight = module.base_layer.weight
+
+                # DeepSpeed ZeRO-2: parameters may be sharded; gather for computation.
+                sharded = (
+                    hasattr(weight_A, "ds_id")
+                    or hasattr(weight_B, "ds_id")
+                    or hasattr(base_weight, "ds_id")
+                )
+                if sharded:
+                    from deepspeed.zero import GatheredParameters
+                    with GatheredParameters([weight_A, weight_B, base_weight], modifier_rank=None):
+                        c_val = self._project_one_layer(name, module, adapter_name, alpha_tr, delta_tr)
+                else:
+                    c_val = self._project_one_layer(name, module, adapter_name, alpha_tr, delta_tr)
+
+                total_layers += 1
+                if c_val is not None and c_val < 1.0:
+                    projected_layers += 1
+                    if is_main:
+                        delta_norm = CurvatureLora.effective_delta_weight_norm(module, adapter_name)
+                        base_norm = torch.linalg.vector_norm(base_weight.float())
+                        rel_norm = (delta_norm / base_norm).item() if base_norm > 0 else float("nan")
+                        logger.info(
+                            "trust_region: %s rel_norm=%.6f alpha_tr=%.4f c=%.6f",
+                            name, rel_norm, alpha_tr, c_val,
+                        )
+
+        if is_main and total_layers > 0:
+            logger.info(
+                "trust_region summary: %d/%d layers projected (alpha_tr=%.4f)",
+                projected_layers, total_layers, alpha_tr,
+            )
+
+    def _project_one_layer(self, name, module, adapter_name, alpha_tr, delta_tr):
+        """Compute c and rescale A, B for one layer (called inside no_grad). Returns c or None."""
+        delta_norm = CurvatureLora.effective_delta_weight_norm(module, adapter_name)
+        base_norm = torch.linalg.vector_norm(module.base_layer.weight.float())
+        denominator = delta_norm.clamp(min=delta_tr)
+        c = alpha_tr * base_norm / denominator
+        c = c.clamp(max=1.0)
+
+        if c < 1.0:
+            sqrt_c = c.sqrt()
+            weight_A = module.lora_A[adapter_name].weight
+            weight_B = module.lora_B[adapter_name].weight
+            compute_dtype = weight_A.dtype
+            weight_A.data.mul_(sqrt_c.to(dtype=compute_dtype))
+            weight_B.data.mul_(sqrt_c.to(dtype=compute_dtype))
+        return c.item()
+
     def _collect_factors(self) -> None:
         tracker = self._tracker
         self._local_projections = {}
@@ -536,14 +643,58 @@ class CurvatureTrainerMixin:
             tracker.deactivate_chunk(chunk_idx)
 
     def _apply_projections(self) -> None:
-        projections = self._distributed_share_projections() if self.args.world_size > 1 else self._local_projections
-        for name, module in self._target_modules.items():
-            adapter_name = self._adapter_names[name]
-            U_in_bar, U_out_bar = projections[name]
-            ref = module.lora_A[adapter_name].weight
-            module._buffers[f"U_in_bar_{adapter_name}"] = U_in_bar.to(ref)
-            module._buffers[f"U_out_bar_{adapter_name}"] = U_out_bar.to(ref)
+        try:
+            if self.args.world_size > 1:
+                self._distributed_apply_projections()
+            else:
+                for name, module in self._target_modules.items():
+                    adapter_name = self._adapter_names[name]
+                    U_in_bar, U_out_bar = self._local_projections[name]
+                    ref = module.lora_A[adapter_name].weight
+                    module._buffers[f"U_in_bar_{adapter_name}"] = U_in_bar.to(ref)
+                    module._buffers[f"U_out_bar_{adapter_name}"] = U_out_bar.to(ref)
+        except Exception:
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+            raise
 
+    def _distributed_apply_projections(self) -> None:
+        device = self.accelerator.device
+        rank = self.args.process_index
+        world_size = self.args.world_size
+        module_names = list(self._target_modules.keys())
+
+        shapes = torch.zeros(len(module_names), 2, dtype=torch.long, device=device)
+        for i, name in enumerate(module_names):
+            if i % world_size == rank:
+                U_in, U_out = self._local_projections[name]
+                shapes[i, 0], shapes[i, 1] = U_in.shape[1], U_out.shape[1]
+        shapes = self.accelerator.reduce(shapes, reduction="sum")
+
+        for i, name in enumerate(module_names):
+            owner = i % world_size
+            module = self._target_modules[name]
+            adapter_name = self._adapter_names[name]
+            ref = module.lora_A[adapter_name].weight
+            in_cols, out_cols = int(shapes[i, 0].item()), int(shapes[i, 1].item())
+
+            if owner == rank:
+                buf_in = self._local_projections[name][0].to(device=device, dtype=torch.float32)
+            else:
+                buf_in = torch.zeros(module.in_features, in_cols, dtype=torch.float32, device=device)
+            buf_in = self.accelerator.reduce(buf_in, reduction="sum").to(ref)   # 立刻转 bf16
+            module._buffers[f"U_in_bar_{adapter_name}"] = buf_in
+
+            if owner == rank:
+                buf_out = self._local_projections[name][1].to(device=device, dtype=torch.float32)
+            else:
+                buf_out = torch.zeros(module.out_features, out_cols, dtype=torch.float32, device=device)
+            buf_out = self.accelerator.reduce(buf_out, reduction="sum").to(ref)
+            module._buffers[f"U_out_bar_{adapter_name}"] = buf_out
+
+            if owner == rank:
+                del self._local_projections[name]
+        self._local_projections.clear()
     def _distributed_share_projections(self) -> Dict[str, tuple]:
         device = self.accelerator.device
         rank = self.args.process_index

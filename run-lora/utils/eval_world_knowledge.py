@@ -13,6 +13,7 @@ TASK_METRIC_PREFERENCES = {
     "triviaqa": ["exact_match", "f1", "acc"],
     "nq_open": ["exact_match", "f1", "acc"],
     "webqs": ["f1", "exact_match", "acc"],
+    "mmlu": ["acc", "acc_norm", "exact_match"],
 }
 
 def resolve_base_model(
@@ -40,6 +41,10 @@ def resolve_base_model(
         if not task:
             raise ValueError("--task is required for LoRA-GA base model resolution")
         return os.path.realpath(f"{output_home}/output/LoRA-GA-{model_abbr}-r{rank}-{task}")
+    if peft in ("Corda-KPM", "Corda-IPM"):
+        if not task:
+            raise ValueError(f"--task is required for {peft} base model resolution")
+        return os.path.realpath(f"{output_home}/output/{peft}-{model_abbr}-r{rank}-{task}")
     return model
 
 
@@ -99,6 +104,12 @@ def parse_args():
     parser.add_argument("--output_home", type=str, default="./")
     parser.add_argument("--gpus", type=str, default="0")
     parser.add_argument("--timestamp", type=str, default="")
+    parser.add_argument(
+        "--tasks",
+        type=str,
+        default=None,
+        help="Comma-separated task list. Defaults to triviaqa,nq_open,webqs. Use 'mmlu' for MMLU-only patch.",
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -169,7 +180,7 @@ def run_lm_eval(model_path, tasks, gpus, batch_size, limit):
         f"tensor_parallel_size={tensor_parallel_size},"
         "dtype=auto,"
         "gpu_memory_utilization=0.7,"
-        "max_model_len=1024,"
+        "max_model_len=2048,"
         "max_num_seqs=8"
     )
     print(f"[WK] Running lm_eval tasks={tasks}, limit={limit}, batch_size={batch_size}")
@@ -194,7 +205,13 @@ def write_json(path, data):
 def main():
     args = parse_args()
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    # V1 detokenizer crashes with "Invalid prefix" on multi-byte Unicode tokens
+    # (e.g., Gemma3 tokenizer with emoji / rare characters).
+    # Fall back to V0 engine until vLLM fixes incremental detokenization.
+    os.environ["VLLM_USE_V1"] = "0"
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+
+    tasks = [t.strip() for t in args.tasks.split(",")] if args.tasks else TASKS
 
     base_model_path = resolve_base_model(
         peft=args.peft,
@@ -208,17 +225,26 @@ def main():
     )
     temp_path = make_temp_dir(args.output_path, args.temp_path)
 
+    output_file = os.path.join(args.output_path, "world_knowledge.json")
+    details_file = os.path.join(args.output_path, "world_knowledge_lm_eval.json")
+
     try:
         print(f"[WK] Base model: {base_model_path}")
         print(f"[WK] Adapter:    {args.lora}")
         print(f"[WK] GPUs:       {args.gpus}")
+        print(f"[WK] Tasks:      {tasks}")
 
         merge_adapter_to_temp(base_model_path, args.lora, temp_path)
-        results = run_lm_eval(temp_path, TASKS, args.gpus, args.batch_size, args.limit)
-        world_knowledge, details = extract_world_knowledge_scores(results, TASKS)
+        results = run_lm_eval(temp_path, tasks, args.gpus, args.batch_size, args.limit)
+        world_knowledge, details = extract_world_knowledge_scores(results, tasks)
 
-        output_file = os.path.join(args.output_path, "world_knowledge.json")
-        details_file = os.path.join(args.output_path, "world_knowledge_lm_eval.json")
+        # If running a subset (e.g., MMLU patch), merge into existing JSON
+        if args.tasks and os.path.exists(output_file):
+            with open(output_file, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            existing.update(world_knowledge)
+            world_knowledge = existing
+            print(f"[WK] Merged new scores into existing {output_file}")
 
         write_json(output_file, world_knowledge)
         write_json(
@@ -230,7 +256,7 @@ def main():
             },
         )
 
-        for task in TASKS:
+        for task in tasks:
             metric = details["selected_metrics"].get(task)
             print(f"[WK] {task}: {world_knowledge[task]} ({metric})")
         print(f"[WK] Saved scores: {output_file}")

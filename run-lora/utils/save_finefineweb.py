@@ -11,16 +11,20 @@ from tqdm import tqdm
 
 DATASET_ID = "m-a-p/FineFineWeb-validation"
 DEFAULT_NUM_SAMPLES = 16_384
+DEFAULT_CORDA_SAMPLES = 256
 DEFAULT_SEED = 42
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "lora-dataset" / "curvature"
+DEFAULT_CORDA_DIR = Path(__file__).resolve().parents[1] / "lora-dataset" / "corda"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default=DATASET_ID, help="Hugging Face dataset id to sample.")
     parser.add_argument("--num_samples", type=int, default=DEFAULT_NUM_SAMPLES, help="Number of non-empty text records to save.")
+    parser.add_argument("--corda_num_samples", type=int, default=DEFAULT_CORDA_SAMPLES, help="Number of samples for Corda copy.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Shuffle seed before sampling.")
     parser.add_argument("--output_path", default=None, help="Output JSONL path. Defaults under run-lora/lora-dataset/curvature/.")
+    parser.add_argument("--corda_output_path", default=None, help="Output JSONL path for Corda copy. Defaults under run-lora/lora-dataset/corda/.")
     return parser.parse_args()
 
 
@@ -29,11 +33,18 @@ def default_output_path(dataset: str, num_samples: int, seed: int) -> Path:
     return DEFAULT_OUTPUT_DIR / f"{name}_{num_samples}_seed{seed}.jsonl"
 
 
+def default_corda_output_path(dataset: str) -> Path:
+    name = dataset.split("/")[-1].replace("-", "_").lower()
+    return DEFAULT_CORDA_DIR / f"{name}.jsonl"
+
+
 def main():
     args = parse_args()
 
     output_path = Path(args.output_path) if args.output_path else default_output_path(args.dataset, args.num_samples, args.seed)
+    corda_path = Path(args.corda_output_path) if args.corda_output_path else default_corda_output_path(args.dataset)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    corda_path.parent.mkdir(parents=True, exist_ok=True)
 
     data_files = sorted(
         file_name
@@ -46,11 +57,18 @@ def main():
     dataset = dataset.shuffle(seed=args.seed)
     dataset = dataset.select(range(args.num_samples))
 
+    # Save curvature anchor set (full size)
     with output_path.open("w", encoding="utf-8") as f:
         for row in tqdm(dataset, desc=f"Writing {output_path}"):
             f.write(json.dumps({"text": row["text"]}, ensure_ascii=False) + "\n")
-
     print(f"Saved {len(dataset)} records to {output_path}")
+
+    # Save Corda calibration copy (smaller subset)
+    corda_samples = min(args.corda_num_samples, len(dataset))
+    with corda_path.open("w", encoding="utf-8") as f:
+        for row in tqdm(dataset.select(range(corda_samples)), desc=f"Writing {corda_path}"):
+            f.write(json.dumps({"text": row["text"]}, ensure_ascii=False) + "\n")
+    print(f"Saved {corda_samples} records to {corda_path}")
 
 
 if __name__ == "__main__":
