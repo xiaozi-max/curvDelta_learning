@@ -4,7 +4,7 @@ set -e
 
 # Minimal base-model evaluator (no training).
 # Usage:
-#   bash scripts/eval_base.sh --model "gemma-3-1b-pt" --model_abbr gemma-3-1b --task metamath
+#   bash scripts/eval_base.sh --model google/gemma-3-1b-pt --model_abbr gemma-3-1b --task metamath
 #   bash scripts/eval_base.sh --model Qwen/Qwen3-0.6B-Base --model_abbr qwen-3-0.6b --task python
 
 model=""; model_abbr=""; task=""; inference_bs=400; gpus=""
@@ -16,6 +16,7 @@ done
 
 [[ -z "$gpus" ]] && { grab_gpus 1 40000 100 3; gpus="$CUDA_VISIBLE_DEVICES"; }
 
+model_path="${ROOT_DIR}/models/${model}"
 data="./lora-dataset/pissa-dataset"
 output_path=$(readlink -m "./output_base/${task}-Base-${model_abbr}")
 mkdir -p "$output_path"
@@ -24,7 +25,7 @@ echo ">>> Base eval: $model_abbr / $task -> $output_path"
 
 # ===== Math / Code =====
 python3 utils/gen_vllm_lora/math_code.py \
-  --model "${ROOT_DIR}/models/$model" --sub_task "$task" --data_path "$data" \
+  --model "$model_path" --sub_task "$task" --data_path "$data" \
   --batch_size $inference_bs --output_file "$resp_file" \
   --gpus "$gpus" --temp_path "${output_path}/temp_merged"
 
@@ -38,12 +39,14 @@ fi
 
 # ===== World Knowledge =====
 echo ">>> World Knowledge (lm-eval)"
-python3 -c "
+# V1 detokenizer crashes with "Invalid prefix" on multi-byte Unicode tokens.
+VLLM_USE_V1=0 VLLM_WORKER_MULTIPROC_METHOD=spawn python3 -c "
 import lm_eval, json
 r = lm_eval.simple_evaluate(model='vllm',
-  model_args='pretrained=${model},tensor_parallel_size=1,dtype=auto,gpu_memory_utilization=0.7,max_model_len=1024,max_num_seqs=8',
-  tasks=['triviaqa','nq_open','webqs'], num_fewshot=5, batch_size='auto', device='cuda:0')
-s = {t: r['results'][t] for t in ['triviaqa','nq_open','webqs']}
+  model_args='pretrained=${model_path},tensor_parallel_size=1,dtype=auto,'
+             'gpu_memory_utilization=0.7,max_model_len=1024,max_num_seqs=8',
+  tasks=['triviaqa','nq_open','mmlu'], num_fewshot=5, batch_size='auto', device='cuda:0')
+s = {t: r['results'][t] for t in ['triviaqa','nq_open','mmlu']}
 json.dump(s, open('${output_path}/world_knowledge.json','w'), indent=2)
 for t,v in s.items(): print(f'  {t}: {v}')
 "

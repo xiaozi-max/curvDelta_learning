@@ -9,6 +9,9 @@ huggingface-cli download --repo-type dataset --resume-download fxmeng/pissa-data
     --include "metamath/*" "python/*" \
     --local-dir ./lora-dataset/pissa-dataset
 
+# NQ-open calibration data for CorDA-KPM and CurvatureLoRA.
+python3 utils/save_nq_open.py
+
 # 2. Commonsense Reasoning (LLM-Adapters)
 
 # Training dataset
@@ -38,6 +41,5 @@ json.dump(res, open("./lora-dataset/instruction-dataset/alpaca_clean.json", "w")
 # Testing dataset (IFEval)
 wget -O ./lora-dataset/instruction-dataset/input_data.jsonl \
     https://raw.githubusercontent.com/google-research/google-research/master/instruction_following_eval/data/input_data.jsonl
-
 
 

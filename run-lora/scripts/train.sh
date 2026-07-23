@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source "$(git rev-parse --show-toplevel)/common_utils/server_env.sh"
+source "common_utils/server_env.sh"
 
 # =====================
 # default values
@@ -9,7 +9,7 @@ model="${ROOT_DIR}/models/meta-llama/Llama-2-7b-hf"   # model path
 model_abbr="Llama-2-7b"            # model name abbr
 data="pissa-dataset"               # data path
 task="metamath"                    # task name
-peft="LoRA"                        # peft method: LoRA, CurvatureLoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT
+peft="LoRA"                        # peft method: LoRA, CurvatureLoRA, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT
 rank=128                           # lora rank
 lr=2e-5                            # learning rate
 bs=128                             # total (global) batch size you want to simulate
@@ -23,7 +23,16 @@ output_home="./"                   # reroute the whole "output" folder to other 
 output_path=""                     # the path to save exp results
 gralora_k=2                        # GraLoRA k parameter
 randlora_alpha=640.0               # RandLoRA alpha parameter
-curvature_data_path="./lora-dataset/curvature/finefineweb_validation_16384_seed42.jsonl"  # CurvatureLoRA anchor JSONL
+
+curvature_data_path="./lora-dataset/corda/finefineweb_validation.jsonl"  # CurvatureLoRA anchor JSONL (256 FineFineWeb, same as Corda)
+curvature_energy_ratio=0.9  # KFAC top-eigenvector energy ratio for CurvatureLoRA projections
+curvature_num_chunks=1  # KFAC chunk count (>1 stores matrices on CPU, lowering GPU VRAM)
+curvature_alpha_tr=0.0  # trust-region alpha: ||Delta W_eff||_F <= alpha_tr * ||W_base||_F. 0 = disabled.
+curvature_delta_tr=1e-12  # numerical stabilizer for trust-region denominator
+curvature_lr_scheduler="cosine"  # lr_scheduler_type for CurvatureLoRA (cosine or constant_with_warmup)
+corda_data_path="./lora-dataset/corda/finefineweb_validation.jsonl"  # Local CorDA calibration JSONL (FineFineWeb)
+corda_num_samples=256                   # Number of local calibration samples for CorDA
+logging_steps=20  # log every N steps to reduce terminal spam
 
 # =====================
 # help function
@@ -37,7 +46,7 @@ Options:
   --model_abbr NAME  Model abbreviation name (default: $model_abbr)
   --data PATH        Data path (default: $data)
   --task NAME        Task name, e.g., metamath, python, conversation (default: "$task")
-  --peft NAME        PEFT method: LoRA, CurvatureLoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
+  --peft NAME        PEFT method: LoRA, CurvatureLoRA, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
   --rank INT         LoRA rank (default: $rank)
   --lr FLOAT         Learning rate (default: $lr)
   --bs INT           Global batch size (default: $bs)
@@ -52,6 +61,13 @@ Options:
   --gralora_k INT    GraLoRA k parameter (default: $gralora_k)
   --randlora_alpha FLOAT  RandLoRA alpha parameter (default: $randlora_alpha)
   --curvature_data_path PATH  CurvatureLoRA anchor JSONL (default: $curvature_data_path)
+  --curvature_energy_ratio FLOAT  KFAC energy ratio for CurvatureLoRA (default: $curvature_energy_ratio)
+  --curvature_num_chunks INT  KFAC chunk count for CurvatureLoRA (default: $curvature_num_chunks)
+  --curvature_alpha_tr FLOAT  Trust-region alpha (0=disabled) (default: $curvature_alpha_tr)
+  --curvature_delta_tr FLOAT  Trust-region stabilizer (default: $curvature_delta_tr)
+  --curvature_lr_scheduler STR  LR scheduler for CurvatureLoRA: cosine or constant_with_warmup (default: $curvature_lr_scheduler)
+  --corda_data_path PATH  Local CorDA calibration data path (default: $corda_data_path)
+  --corda_num_samples INT Number of CorDA calibration samples (default: $corda_num_samples)
   --help             Show this help message and exit
 EOF
 }
@@ -60,7 +76,7 @@ EOF
 # parse long options
 # =====================
 TEMP=$(getopt -o '' \
-  --long model:,model_abbr:,data:,task:,peft:,rank:,lr:,bs:,per_bs:,model_max_length:,gpus:,trial_id:,master_port:,timestamp:,output_home:,output_path:,gralora_k:,randlora_alpha:,curvature_data_path:,help \
+  --long model:,model_abbr:,data:,task:,peft:,rank:,lr:,bs:,per_bs:,model_max_length:,gpus:,trial_id:,master_port:,timestamp:,output_home:,output_path:,gralora_k:,randlora_alpha:,curvature_data_path:,curvature_energy_ratio:,curvature_num_chunks:,curvature_alpha_tr:,curvature_delta_tr:,curvature_lr_scheduler:,corda_data_path:,corda_num_samples:,help \
   -n "$0" -- "$@")
 if [ $? != 0 ]; then
     echo "Error parsing options." >&2
@@ -88,6 +104,13 @@ while true; do
     --gralora_k)    gralora_k="$2"; shift 2 ;;
     --randlora_alpha) randlora_alpha="$2"; shift 2 ;;
     --curvature_data_path) curvature_data_path="$2"; shift 2 ;;
+    --curvature_energy_ratio) curvature_energy_ratio="$2"; shift 2 ;;
+    --curvature_num_chunks) curvature_num_chunks="$2"; shift 2 ;;
+    --curvature_alpha_tr) curvature_alpha_tr="$2"; shift 2 ;;
+    --curvature_delta_tr) curvature_delta_tr="$2"; shift 2 ;;
+    --curvature_lr_scheduler) curvature_lr_scheduler="$2"; shift 2 ;;
+    --corda_data_path) corda_data_path="$2"; shift 2 ;;
+    --corda_num_samples) corda_num_samples="$2"; shift 2 ;;
     --help)         show_help; exit 0 ;;
     --) shift; break ;;
     *) echo "Internal error!"; exit 1 ;;
@@ -97,8 +120,8 @@ done
 # =====================
 # validations (types & allowed sets)
 # =====================
-if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
-  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
+if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
+  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
   exit 2
 fi
 if [[ ! "$rank" =~ ^[0-9]+$ ]]; then
@@ -223,6 +246,15 @@ echo "TOTAL_BATCH_SIZE (effective): $eff_bs"
 echo "Output Path: $output_path"
 if [[ "$peft" == "CurvatureLoRA" ]]; then
   echo "Curvature Data Path: $curvature_data_path"
+  echo "Curvature Energy Ratio: $curvature_energy_ratio"
+  if [[ "$curvature_alpha_tr" != "0.0" && "$curvature_alpha_tr" != "0" ]]; then
+    echo "Curvature Trust Region: alpha_tr=$curvature_alpha_tr delta_tr=$curvature_delta_tr"
+  fi
+  echo "Curvature LR Scheduler: $curvature_lr_scheduler"
+fi
+if [[ "$peft" == Corda-* ]]; then
+  echo "CorDA Data Path: $corda_data_path"
+  echo "CorDA Num Samples: $corda_num_samples"
 fi
 echo "Time stamp: $timestamp"
 echo "Trial ID: $trial_id"
@@ -272,7 +304,7 @@ if [[ "$peft" == "PiSSA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 elif [[ "$peft" == "MiLoRA" ]]; then
   res_model=$(readlink -m "${output_home}/output/MiLoRA-${model_abbr}-r${rank}")
@@ -313,7 +345,7 @@ elif [[ "$peft" == "MiLoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 elif [[ "$peft" == "LoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -342,15 +374,17 @@ elif [[ "$peft" == "LoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 elif [[ "$peft" == "CurvatureLoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
     --use_curvature_lora True \
     --curvature_data_path "$curvature_data_path" \
-    --curvature_energy_ratio 0.9 \
+    --curvature_energy_ratio "$curvature_energy_ratio" \
     --curvature_collection_batch_size 1 \
-    --curvature_num_chunks 1 \
+    --curvature_num_chunks "$curvature_num_chunks" \
+    --curvature_alpha_tr "$curvature_alpha_tr" \
+    --curvature_delta_tr "$curvature_delta_tr" \
     --deepspeed configs/ds_config_zero2_no_offload.json \
     --model_name_or_path "$model" \
     --full_finetune False \
@@ -373,10 +407,64 @@ elif [[ "$peft" == "CurvatureLoRA" ]]; then
     --save_strategy "no" \
     --weight_decay 0.0 \
     --warmup_ratio 0.03 \
+    --lr_scheduler_type "$curvature_lr_scheduler" \
+    --report_to "wandb" \
+    --trial_id $trial_id \
+    --logging_steps $logging_steps \
+    --gradient_checkpointing True
+
+elif [[ "$peft" == Corda-* ]]; then
+  corda_method="kpm"
+  corda_label="KPM"
+  if [[ "$peft" == "Corda-IPM" ]]; then
+    corda_method="ipm"
+    corda_label="IPM"
+  fi
+  res_model=$(readlink -m "${output_home}/output/Corda-${corda_label}-${model_abbr}-r${rank}-${task_base}")
+  if [[ -e "$res_model" ]]; then
+    echo "Use pre-initialized CorDA ${corda_method} model at: $res_model"
+  else
+    echo "Perform CorDA ${corda_method} initialization..."
+    python utils/init_corda.py \
+      --device "cuda:0" \
+      --base_model_path "$model" \
+      --output_dir "$res_model" \
+      --data_path "$corda_data_path" \
+      --sub_task "$task_base" \
+      --corda_method "$corda_method" \
+      --corda_num_samples "$corda_num_samples" \
+      --corda_cache_dir "${output_home}/output/corda_cache/${model_abbr}" \
+      --bits "bf16" \
+      --lora_r "$rank" \
+      --lora_alpha "$rank" \
+      --lora_dropout 0 \
+      --target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
+      --model_max_length "$model_max_length"
+  fi
+
+  deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
+    --deepspeed configs/ds_config_zero2_no_offload.json \
+    --model_name_or_path "$res_model" \
+    --adapter_name_or_path "corda_init" \
+    --full_finetune False \
+    --bf16 \
+    --data_path "$data" \
+    --sub_task "$task" \
+    --dataset_split train \
+    --dataset_field instruction output \
+    --output_dir "$output_path" \
+    --num_train_epochs "$num_train_epochs" \
+    --model_max_length "$model_max_length" \
+    --per_device_train_batch_size "$per_bs" \
+    --gradient_accumulation_steps "$gradient_accumulation_steps" \
+    --learning_rate "$lr" \
+    --save_strategy "no" \
+    --weight_decay 0.0 \
+    --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 elif [[ "$peft" == "DoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -406,7 +494,7 @@ elif [[ "$peft" == "DoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 elif [[ "$peft" == "OLoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -436,7 +524,7 @@ elif [[ "$peft" == "OLoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 elif [[ "$peft" == "LoRA-GA" ]]; then
   res_model=$(readlink -m "${output_home}/output/LoRA-GA-${model_abbr}-r${rank}-${task_base}")
@@ -483,7 +571,7 @@ elif [[ "$peft" == "LoRA-GA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 elif [[ "$peft" == "InitAB" ]]; then
   initAB_res_model=$(readlink -m "${output_home}/output/InitAB-${model_abbr}-r${rank}-${timestamp}")
@@ -515,7 +603,7 @@ elif [[ "$peft" == "InitAB" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 elif [[ "$peft" == "GraLoRA" ]]; then
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -546,7 +634,7 @@ elif [[ "$peft" == "GraLoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 elif [[ "$peft" == "RandLoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -575,7 +663,7 @@ elif [[ "$peft" == "RandLoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 elif [[ "$peft" == "LoFT" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -605,10 +693,10 @@ elif [[ "$peft" == "LoFT" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps 1
+    --logging_steps $logging_steps
 
 else
   echo "Error: Unsupported PEFT method: $peft" >&2
-  echo "Supported methods: LoRA, CurvatureLoRA, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT" >&2
+  echo "Supported methods: LoRA, CurvatureLoRA, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT" >&2
   exit 1
 fi
