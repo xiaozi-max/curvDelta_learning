@@ -46,7 +46,7 @@ Options:
   --model_abbr NAME  Model abbreviation name (default: $model_abbr)
   --data PATH        Data path (default: $data)
   --task NAME        Task name, e.g., metamath, python, conversation (default: "$task")
-  --peft NAME        PEFT method: LoRA, CurvatureLoRA, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
+  --peft NAME        PEFT method: LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
   --rank INT         LoRA rank (default: $rank)
   --lr FLOAT         Learning rate (default: $lr)
   --bs INT           Global batch size (default: $bs)
@@ -120,8 +120,8 @@ done
 # =====================
 # validations (types & allowed sets)
 # =====================
-if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
-  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
+if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|CurvatureDense|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
+  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
   exit 2
 fi
 if [[ ! "$rank" =~ ^[0-9]+$ ]]; then
@@ -250,6 +250,11 @@ if [[ "$peft" == "CurvatureLoRA" ]]; then
   if [[ "$curvature_alpha_tr" != "0.0" && "$curvature_alpha_tr" != "0" ]]; then
     echo "Curvature Trust Region: alpha_tr=$curvature_alpha_tr delta_tr=$curvature_delta_tr"
   fi
+  echo "Curvature LR Scheduler: $curvature_lr_scheduler"
+fi
+if [[ "$peft" == "CurvatureDense" ]]; then
+  echo "Curvature Data Path: $curvature_data_path"
+  echo "Curvature Energy Ratio: $curvature_energy_ratio"
   echo "Curvature LR Scheduler: $curvature_lr_scheduler"
 fi
 if [[ "$peft" == Corda-* ]]; then
@@ -394,6 +399,37 @@ elif [[ "$peft" == "CurvatureLoRA" ]]; then
     --lora_rank "$rank" \
     --lora_alpha "$rank" \
     --lora_dropout 0 \
+    --data_path "$data" \
+    --sub_task "$task" \
+    --dataset_split train \
+    --dataset_field instruction output \
+    --output_dir "$output_path" \
+    --num_train_epochs "$num_train_epochs" \
+    --model_max_length "$model_max_length" \
+    --per_device_train_batch_size "$per_bs" \
+    --gradient_accumulation_steps "$gradient_accumulation_steps" \
+    --learning_rate "$lr" \
+    --save_strategy "no" \
+    --weight_decay 0.0 \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "$curvature_lr_scheduler" \
+    --report_to "wandb" \
+    --trial_id $trial_id \
+    --logging_steps $logging_steps \
+    --gradient_checkpointing True
+
+elif [[ "$peft" == "CurvatureDense" ]]; then
+  deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
+    --use_curvature_dense True \
+    --curvature_data_path "$curvature_data_path" \
+    --curvature_energy_ratio "$curvature_energy_ratio" \
+    --curvature_collection_batch_size 1 \
+    --curvature_num_chunks "$curvature_num_chunks" \
+    --deepspeed configs/ds_config_zero2_no_offload.json \
+    --model_name_or_path "$model" \
+    --full_finetune False \
+    --bf16 \
+    --target_modules "q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj" \
     --data_path "$data" \
     --sub_task "$task" \
     --dataset_split train \
@@ -697,6 +733,6 @@ elif [[ "$peft" == "LoFT" ]]; then
 
 else
   echo "Error: Unsupported PEFT method: $peft" >&2
-  echo "Supported methods: LoRA, CurvatureLoRA, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT" >&2
+  echo "Supported methods: LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT" >&2
   exit 1
 fi

@@ -34,15 +34,17 @@ for seed in "${seeds[@]}"; do
 
       timestamp=$(date +"%Y%m%d-%H%M%S")
       _er_suffix=""
-      if [[ "$peft" == "CurvatureLoRA" ]]; then
+      if [[ "$peft" == "CurvatureLoRA" || "$peft" == "CurvatureDense" ]]; then
         _er_suffix="-er${curvature_energy_ratio//./}"
         if [[ "${curvature_lr_scheduler:-cosine}" == "constant_with_warmup" ]]; then
           _er_suffix="${_er_suffix}-cww"
         fi
-        _tr_alpha="${curvature_alpha_tr:-0.0}"
-        if [[ "$_tr_alpha" != "0.0" && "$_tr_alpha" != "0" ]]; then
-          _tr_suffix="-tr${_tr_alpha//./}"
-          _er_suffix="${_er_suffix}${_tr_suffix}"
+        if [[ "$peft" == "CurvatureLoRA" ]]; then
+          _tr_alpha="${curvature_alpha_tr:-0.0}"
+          if [[ "$_tr_alpha" != "0.0" && "$_tr_alpha" != "0" ]]; then
+            _tr_suffix="-tr${_tr_alpha//./}"
+            _er_suffix="${_er_suffix}${_tr_suffix}"
+          fi
         fi
       fi
       output_path=$(readlink -m \

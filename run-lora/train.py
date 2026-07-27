@@ -16,6 +16,8 @@ import numpy as np
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel, LoraRuntimeConfig
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from utils.curvature_lora import CurvatureTrainer, apply_curvature_lora
+from utils.curvature_dense import CurvatureDenseTrainer, get_curvature_dense_model
+from utils.dense_peft import DenseConfig
 
 IGNORE_INDEX = -100
 logger = logging.getLogger(__name__)
@@ -76,6 +78,8 @@ class TrainingArguments(transformers.TrainingArguments):
     curvature_num_chunks: int = field(default=1, metadata={"help": "Number of target-module chunks for CurvatureLoRA KFAC collection."})
     curvature_alpha_tr: float = field(default=0.0, metadata={"help": "Trust-region alpha: ||Delta W_eff||_F <= alpha_tr * ||W_base||_F. 0 = disabled."})
     curvature_delta_tr: float = field(default=1e-12, metadata={"help": "Numerical stabilizer for trust-region denominator (must be > 0)."})
+    ## CurvatureDense
+    use_curvature_dense: Optional[bool] = field(default=False)
         
     # LoRA setting
     target_modules : Optional[str] = field(default="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj")
@@ -253,79 +257,88 @@ def build_model(script_args, checkpoint_dir):
                                               subfolder=script_args.adapter_name_or_path, is_trainable=True)
 
         else:
-            if script_args.use_gralora:
-                from peft import GraloraConfig
-                peft_config = GraloraConfig(
+            if script_args.use_curvature_dense:
+                # CurvatureDense uses its own DenseModel path — skip LoRA entirely.
+                dense_config = DenseConfig(
                     task_type=TaskType.CAUSAL_LM,
                     target_modules=script_args.target_modules.split(','),
-                    inference_mode=False,
-                    r=script_args.lora_rank,
-                    alpha=script_args.lora_alpha,
-                    gralora_dropout=script_args.lora_dropout,
-                    hybrid_r=0, # since we are not using the HybridGraLoRA method
-                    gralora_k=script_args.gralora_k,
                 )
-
-            elif script_args.use_randlora:
-                from peft import RandLoraConfig
-                peft_config = RandLoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
-                    target_modules=script_args.target_modules.split(','),
-                    inference_mode=False,
-                    r=script_args.lora_rank,
-                    randlora_alpha=script_args.randlora_alpha,
-                    randlora_dropout=script_args.lora_dropout,
-                )
+                model = get_curvature_dense_model(model, dense_config)
 
             else:
-                init_lora_weights = "olora" if script_args.use_olora else script_args.init_weights
-                peft_config = LoraConfig(
-                    use_dora=script_args.use_dora,
-                    runtime_config=LoraRuntimeConfig(ephemeral_gpu_offload=script_args.use_dora),
-                    task_type=TaskType.CAUSAL_LM,
-                    target_modules=script_args.target_modules.split(','),
-                    inference_mode=False,
-                    r=script_args.lora_rank,
-                    lora_alpha=script_args.lora_alpha,
-                    lora_dropout=script_args.lora_dropout,
-                    init_lora_weights=init_lora_weights,
-                )
+                if script_args.use_gralora:
+                    from peft import GraloraConfig
+                    peft_config = GraloraConfig(
+                        task_type=TaskType.CAUSAL_LM,
+                        target_modules=script_args.target_modules.split(','),
+                        inference_mode=False,
+                        r=script_args.lora_rank,
+                        alpha=script_args.lora_alpha,
+                        gralora_dropout=script_args.lora_dropout,
+                        hybrid_r=0, # since we are not using the HybridGraLoRA method
+                        gralora_k=script_args.gralora_k,
+                    )
+
+                elif script_args.use_randlora:
+                    from peft import RandLoraConfig
+                    peft_config = RandLoraConfig(
+                        task_type=TaskType.CAUSAL_LM,
+                        target_modules=script_args.target_modules.split(','),
+                        inference_mode=False,
+                        r=script_args.lora_rank,
+                        randlora_alpha=script_args.randlora_alpha,
+                        randlora_dropout=script_args.lora_dropout,
+                    )
+
+                else:
+                    init_lora_weights = "olora" if script_args.use_olora else script_args.init_weights
+                    peft_config = LoraConfig(
+                        use_dora=script_args.use_dora,
+                        runtime_config=LoraRuntimeConfig(ephemeral_gpu_offload=script_args.use_dora),
+                        task_type=TaskType.CAUSAL_LM,
+                        target_modules=script_args.target_modules.split(','),
+                        inference_mode=False,
+                        r=script_args.lora_rank,
+                        lora_alpha=script_args.lora_alpha,
+                        lora_dropout=script_args.lora_dropout,
+                        init_lora_weights=init_lora_weights,
+                    )
+                    if script_args.use_olora:
+                        # use GPU to perform QR decomposition will be faster
+                        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                        model = model.to(torch.device(f"cuda:{local_rank}"))
+
+                model = get_peft_model(model, peft_config)
+
+                if script_args.use_curvature_lora:
+                    model = apply_curvature_lora(model)
+
                 if script_args.use_olora:
-                    # use GPU to perform QR decomposition will be faster
-                    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-                    model = model.to(torch.device(f"cuda:{local_rank}"))
+                    olora_residual_path = os.path.join(script_args.output_dir, "olora_residual_model")
+                    model_copy = copy.deepcopy(model)
+                    residual = model_copy.unload()
+                    residual.save_pretrained(olora_residual_path)
+                    tok = transformers.AutoTokenizer.from_pretrained(script_args.model_name_or_path)
+                    tok.pad_token_id = tok.eos_token_id
+                    tok.save_pretrained(olora_residual_path)
+                    logger.info(f"OLoRA residual model saved to {olora_residual_path}")
 
-            model = get_peft_model(model, peft_config)
-
-            if script_args.use_curvature_lora:
-                model = apply_curvature_lora(model)
-
-            if script_args.use_olora:
-                olora_residual_path = os.path.join(script_args.output_dir, "olora_residual_model")
-                model_copy = copy.deepcopy(model)
-                residual = model_copy.unload()
-                residual.save_pretrained(olora_residual_path)
-                tok = transformers.AutoTokenizer.from_pretrained(script_args.model_name_or_path)
-                tok.pad_token_id = tok.eos_token_id
-                tok.save_pretrained(olora_residual_path)
-                logger.info(f"OLoRA residual model saved to {olora_residual_path}")
-
-            if script_args.use_initAB:
-                from utils.init_AB_util import modify_initAB_model
-                modify_initAB_model(model, "AB_1_1_RESET")
-                model_copy = copy.deepcopy(model)
-                res_model = model_copy.unload()
-                res_model.save_pretrained(script_args.initAB_res_model)
-                tok = transformers.AutoTokenizer.from_pretrained(script_args.model_name_or_path)
-                tok.pad_token_id = tok.eos_token_id
-                tok.save_pretrained(script_args.initAB_res_model)
-                logger.info(f"InitAB residual model saved to {script_args.initAB_res_model}")
+                if script_args.use_initAB:
+                    from utils.init_AB_util import modify_initAB_model
+                    modify_initAB_model(model, "AB_1_1_RESET")
+                    model_copy = copy.deepcopy(model)
+                    res_model = model_copy.unload()
+                    res_model.save_pretrained(script_args.initAB_res_model)
+                    tok = transformers.AutoTokenizer.from_pretrained(script_args.model_name_or_path)
+                    tok.pad_token_id = tok.eos_token_id
+                    tok.save_pretrained(script_args.initAB_res_model)
+                    logger.info(f"InitAB residual model saved to {script_args.initAB_res_model}")
 
     for name, module in model.named_modules():
         if 'norm' in name or 'gate' in name:
             module = module.to(torch.float32)
 
-    if script_args.local_rank == 0:
+    if script_args.local_rank == 0 and not script_args.use_curvature_dense:
         model.print_trainable_parameters()
 
     return model
@@ -366,6 +379,8 @@ def train():
         logger.info("Load tokenizer from {} over.".format(script_args.model_name_or_path))
 
     resume_from_checkpoint_dir = get_last_checkpoint(script_args.output_dir)
+    if script_args.use_curvature_lora and script_args.use_curvature_dense:
+        raise ValueError("Cannot use both CurvatureLoRA and CurvatureDense simultaneously.")
     if script_args.use_curvature_lora:
         if resume_from_checkpoint_dir is not None:
             raise ValueError("CurvatureLoRA does not support resuming from unfinished checkpoints.")
@@ -373,6 +388,13 @@ def train():
             raise ValueError("--curvature_data_path is required when --use_curvature_lora True.")
         if str(script_args.save_strategy).lower().split(".")[-1] != "no":
             raise ValueError("CurvatureLoRA requires --save_strategy no; only the final folded adapter is saved.")
+    if script_args.use_curvature_dense:
+        if resume_from_checkpoint_dir is not None:
+            raise ValueError("CurvatureDense does not support resuming from unfinished checkpoints.")
+        if script_args.curvature_data_path is None:
+            raise ValueError("--curvature_data_path is required when --use_curvature_dense True.")
+        if str(script_args.save_strategy).lower().split(".")[-1] != "no":
+            raise ValueError("CurvatureDense requires --save_strategy no; only the final folded model is saved.")
     model = build_model(script_args, resume_from_checkpoint_dir)
 
     all_training_dataset = []
@@ -445,6 +467,19 @@ def train():
             curvature_delta_tr=script_args.curvature_delta_tr,
             **data_module,
         )
+    elif script_args.use_curvature_dense:
+        if script_args.use_loft:
+            raise ValueError("CurvatureDense cannot be combined with LoFT optimizer mode.")
+        trainer = CurvatureDenseTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            args=script_args,
+            curvature_data_path=script_args.curvature_data_path,
+            curvature_energy_ratio=script_args.curvature_energy_ratio,
+            curvature_collection_batch_size=script_args.curvature_collection_batch_size,
+            curvature_num_chunks=script_args.curvature_num_chunks,
+            **data_module,
+        )
     elif script_args.use_loft:
         from utils.LoFT.utils import get_optimizer
         optimizer = get_optimizer(model, lr=script_args.learning_rate, LoFT=True)
@@ -459,7 +494,7 @@ def train():
     #     trainer = Trainer(model=model, processing_class=tokenizer, args=script_args, **data_module)
     else:
         trainer = Trainer(model=model, tokenizer=tokenizer, args=script_args, **data_module)
-    if not script_args.full_finetune:
+    if not script_args.full_finetune and not script_args.use_curvature_dense:
         trainer.add_callback(SavePeftModelCallback(tokenizer))
     trainer.train(resume_from_checkpoint=resume_from_checkpoint_dir)
     trainer.save_state()

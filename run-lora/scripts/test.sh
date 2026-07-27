@@ -34,7 +34,7 @@ Options:
                        instruction→ local dir containing IFEval/input_data.jsonl
                      (default: $data_path)
   --task NAME        Task name: metamath, python, commonsense, instruction (default: "$task")
-  --peft NAME        PEFT method: LoRA, CurvatureLoRA, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
+  --peft NAME        PEFT method: LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
   --rank INT         LoRA rank (default: $rank)
   --bs INT           Inference batch size (default: $bs)
   --output_home PATH Reroute the whole "output" folder to other place (default: $output_home)
@@ -87,8 +87,8 @@ fi
 if [[ ! -d "$output_path" ]]; then
   echo "Error: output_path does not exist: $output_path" >&2; exit 1
 fi
-if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
-  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
+if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|CurvatureDense|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
+  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
   exit 2
 fi
 
@@ -138,8 +138,12 @@ elif [[ "$peft" == "Corda-KPM" ]]; then
   base_model=$(readlink -m "${output_home}/output/Corda-KPM-${model_abbr}-r${rank}-${task}")
 elif [[ "$peft" == "Corda-IPM" ]]; then
   base_model=$(readlink -m "${output_home}/output/Corda-IPM-${model_abbr}-r${rank}-${task}")
+elif [[ "$peft" == "CurvatureDense" ]]; then
+  # CurvatureDense saves as a merged full model — load directly without --lora
+  base_model="$output_path/adapter_model"
+  lora_path=""
 else
-  # LoRA, CurvatureLoRA, DoRA, GraLoRA, LoFT — base model with standard adapter
+  # LoRA, CurvatureLoRA, DoRA, GraLoRA, RandLoRA, LoFT — base model with standard adapter
   base_model="$model"
 fi
 
