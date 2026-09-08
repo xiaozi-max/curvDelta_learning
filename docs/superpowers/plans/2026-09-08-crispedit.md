@@ -4,7 +4,7 @@
 
 **Goal:** Integrate CrispEdit as a fixed-cache, full-model baseline for all configured transformer projection layers in `run-lora`.
 
-**Architecture:** Add a focused CrispEdit utility module containing target discovery, one-pass chunked K-FAC collection, Kronecker eigen-mask construction, and an AdamW-compatible gradient projection wrapper. Add a dedicated Trainer/model-save path in `train.py`, then expose it through the unified shell and evaluation loaders. Reuse the existing SFT data pipeline and FineFineWeb/KFAC token handling.
+**Architecture:** Add a focused CrispEdit utility module containing target discovery, one-pass chunked K-FAC collection, Kronecker eigen-mask construction, and a fixed-cache AdamW gradient-projection optimizer. Add a dedicated Trainer/model-save path in `train.py`, then expose it through the unified shell and evaluation loaders. Reuse the existing SFT data pipeline and FineFineWeb/KFAC token handling.
 
 **Tech Stack:** Python 3.12, PyTorch, Transformers Trainer, Accelerate/DeepSpeed, Hugging Face Datasets, existing `run-lora/utils/curvature_lora.py` KFAC tracker, AdamW, cosine scheduler.
 
@@ -32,11 +32,11 @@ Read these files in addition to this plan: `run-lora/train.py`, `run-lora/script
 - Produce `discover_target_modules(model, target_modules) -> dict[str, torch.nn.Linear]`.
 - Produce `build_kronecker_projection_cache(factor_a, factor_b, energy_ratio) -> dict[str, torch.Tensor]` with `Ua`, `Ub`, and boolean `M`.
 - Produce `project_gradient(grad, cache) -> torch.Tensor` using the exact CrispEdit orientation and `M.T`.
-- Produce `projected_adamw(params, projection_cache, **adamw_kwargs) -> torch.optim.Optimizer` or an equivalent optimizer class whose `step()` projects only mapped 2-D gradients before delegating to AdamW.
+- Produce a dedicated fixed-cache AdamW optimizer whose `step()` projects only mapped 2-D gradients, then applies the standard AdamW update. It does not expose or preserve the original CrispEdit Adam compatibility/reset/momentum APIs.
 
 - [ ] Write tests with small SPD factors and a hand-computed expected projected gradient; assert `M.T` orientation, untouched non-2-D gradients, and unmapped parameters.
 - [ ] Run `python -m pytest run-lora/utils/test_crispedit.py -q` and confirm the pre-implementation test fails.
-- [ ] Implement eigendecomposition, energy thresholding, cache storage, and AdamW projection without any reset/recompute API.
+- [ ] Implement eigendecomposition, energy thresholding, cache storage, and the direct AdamW update path without any Adam compatibility, reset/recompute, or momentum-projection API.
 - [ ] Run the focused test and confirm it passes.
 
 ### Task 2: Implement one-pass chunked FineFineWeb K-FAC collection
@@ -70,7 +70,7 @@ Read these files in addition to this plan: `run-lora/train.py`, `run-lora/script
 - [ ] Add a model-construction test asserting only all requested projection weights require gradients.
 - [ ] Run it before implementation and record the expected failure.
 - [ ] Implement validation against incompatible PEFT flags, require calibration data, call fixed collection once before the first optimizer step, and use the existing SFT dataset/collator unchanged.
-- [ ] Ensure the trainer never invokes cache reset/recompute and never projects optimizer momentum separately.
+- [ ] Ensure the trainer never invokes cache reset/recompute and never projects optimizer momentum separately; only the current gradient is projected before the standard AdamW update.
 - [ ] Run focused lifecycle tests with a tiny causal-LM stub and verify AdamW/cosine scheduler objects.
 
 ### Task 4: Expose training CLI and reproducible model-family scripts
