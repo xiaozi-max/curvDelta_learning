@@ -2,7 +2,7 @@
 
 ## Goal
 
-Add CrispEdit to `run-lora` as a full-model baseline that directly updates all configured transformer projection weights, uses one fixed FineFineWeb K-FAC cache, AdamW, and the repository's cosine learning-rate schedule.
+Add CrispEdit to `run-lora` as a full-model baseline that directly updates all configured transformer projection weights, uses one fixed FineFineWeb K-FAC cache, the repository's standard optimizer setup, and cosine as its only learning-rate scheduler.
 
 ## Scope and artifact
 
@@ -24,7 +24,7 @@ Only two-dimensional target weight gradients are projected. There is no cache re
 
 ## Training integration
 
-Reuse `run-lora/train.py` for model loading, task dataset loading, prompt/response tokenization, label masking, collation, logging, and checkpoint-independent output conventions. Add a dedicated full-model trainer/optimizer path that applies the projection immediately before AdamW's normal update. Use `torch.optim.AdamW` and always pass `--lr_scheduler_type cosine`; CrispEdit must not expose or inherit the existing curvature scheduler override.
+Reuse `run-lora/train.py` for model loading, task dataset loading, prompt/response tokenization, label masking, collation, logging, and checkpoint-independent output conventions. Add a dedicated full-model trainer/optimizer path that applies the projection immediately before the optimizer update. Use the repository's AdamW optimizer configuration and always pass `--lr_scheduler_type cosine`; CrispEdit must not expose or inherit the existing curvature scheduler override.
 
 The SFT task dataset remains separate from the FineFineWeb calibration dataset. Calibration data is generated/reused through `run-lora/utils/save_finefineweb.py` and is never mixed into the task dataset unless an experiment explicitly enables the existing replay feature.
 
@@ -38,4 +38,4 @@ CurvatureLoRA projects low-rank adapter updates using separate input/output high
 
 ## Validation
 
-The implementation must include focused tests for (1) Kronecker mask orientation and projected-gradient values, (2) chunked factor collection equivalence on a small deterministic model, (3) frozen/non-frozen parameter selection, (4) AdamW plus cosine scheduler wiring, and (5) full-model save/load plus the existing test/world-knowledge loader paths. A reduced end-to-end run should verify that the output artifact reloads and that no adapter-only files are required.
+The implementation must include focused tests for (1) Kronecker mask orientation and projected-gradient values, (2) chunked factor collection equivalence on a small deterministic model, (3) frozen/non-frozen parameter selection, (4) optimizer wiring with the cosine scheduler, and (5) full-model save/load plus the existing test/world-knowledge loader paths. A reduced end-to-end run should verify that the output artifact reloads and that no adapter-only files are required.

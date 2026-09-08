@@ -4,7 +4,7 @@
 
 **Goal:** Integrate CrispEdit as a fixed-cache, full-model baseline for all configured transformer projection layers in `run-lora`.
 
-**Architecture:** Add a focused CrispEdit utility module containing target discovery, one-pass chunked K-FAC collection, Kronecker eigen-mask construction, and a fixed-cache AdamW gradient-projection optimizer. Add a dedicated Trainer/model-save path in `train.py`, then expose it through the unified shell and evaluation loaders. Reuse the existing SFT data pipeline and FineFineWeb/KFAC token handling.
+**Architecture:** Add a focused CrispEdit utility module containing target discovery, one-pass chunked K-FAC collection, Kronecker eigen-mask construction, and a fixed-cache gradient-projection optimizer using the repository's standard optimizer configuration. Add a dedicated Trainer/model-save path in `train.py`, then expose it through the unified shell and evaluation loaders. Reuse the existing SFT data pipeline and FineFineWeb/KFAC token handling.
 
 **Tech Stack:** Python 3.12, PyTorch, Transformers Trainer, Accelerate/DeepSpeed, Hugging Face Datasets, existing `run-lora/utils/curvature_lora.py` KFAC tracker, AdamW, cosine scheduler.
 
@@ -14,8 +14,8 @@
 - Default target modules are `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` across all transformer layers.
 - K-FAC cache is collected exactly once from FineFineWeb context and reused unchanged.
 - Projection must implement `U_B @ ((U_B.T @ grad @ U_A) * M.T) @ U_A.T` for every target 2-D weight gradient.
-- Optimizer is `torch.optim.AdamW`; scheduler is always `--lr_scheduler_type cosine`.
-- Do not implement cache reset, cache recomputation, sequential cache merging, or momentum reprojection.
+- Use the repository's AdamW optimizer configuration; the only learning-rate scheduler is `--lr_scheduler_type cosine`.
+- Do not implement cache reset, cache recomputation, sequential cache merging, or any optimizer-state reprojection.
 - Preserve unrelated dirty-worktree changes.
 
 ## Reference Files For Reproduction
@@ -32,11 +32,11 @@ Read these files in addition to this plan: `run-lora/train.py`, `run-lora/script
 - Produce `discover_target_modules(model, target_modules) -> dict[str, torch.nn.Linear]`.
 - Produce `build_kronecker_projection_cache(factor_a, factor_b, energy_ratio) -> dict[str, torch.Tensor]` with `Ua`, `Ub`, and boolean `M`.
 - Produce `project_gradient(grad, cache) -> torch.Tensor` using the exact CrispEdit orientation and `M.T`.
-- Produce a dedicated fixed-cache AdamW optimizer whose `step()` projects only mapped 2-D gradients, then applies the standard AdamW update. It does not expose or preserve the original CrispEdit Adam compatibility/reset/momentum APIs.
+- Produce a dedicated fixed-cache optimizer whose `step()` projects only mapped 2-D gradients, then applies the repository's standard optimizer update. It does not expose or preserve the original CrispEdit optimizer compatibility/reset/state-reprojection APIs.
 
 - [ ] Write tests with small SPD factors and a hand-computed expected projected gradient; assert `M.T` orientation, untouched non-2-D gradients, and unmapped parameters.
 - [ ] Run `python -m pytest run-lora/utils/test_crispedit.py -q` and confirm the pre-implementation test fails.
-- [ ] Implement eigendecomposition, energy thresholding, cache storage, and the direct AdamW update path without any Adam compatibility, reset/recompute, or momentum-projection API.
+- [ ] Implement eigendecomposition, energy thresholding, cache storage, and the direct optimizer update path without any compatibility, reset/recompute, or optimizer-state projection API.
 - [ ] Run the focused test and confirm it passes.
 
 ### Task 2: Implement one-pass chunked FineFineWeb K-FAC collection
@@ -70,8 +70,8 @@ Read these files in addition to this plan: `run-lora/train.py`, `run-lora/script
 - [ ] Add a model-construction test asserting only all requested projection weights require gradients.
 - [ ] Run it before implementation and record the expected failure.
 - [ ] Implement validation against incompatible PEFT flags, require calibration data, call fixed collection once before the first optimizer step, and use the existing SFT dataset/collator unchanged.
-- [ ] Ensure the trainer never invokes cache reset/recompute and never projects optimizer momentum separately; only the current gradient is projected before the standard AdamW update.
-- [ ] Run focused lifecycle tests with a tiny causal-LM stub and verify AdamW/cosine scheduler objects.
+- [ ] Ensure the trainer never invokes cache reset/recompute or projects optimizer state; only the current gradient is projected before the standard optimizer update.
+- [ ] Run focused lifecycle tests with a tiny causal-LM stub and verify the repository optimizer and cosine scheduler objects.
 
 ### Task 4: Expose training CLI and reproducible model-family scripts
 
