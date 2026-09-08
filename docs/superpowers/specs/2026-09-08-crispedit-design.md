@@ -20,7 +20,7 @@ For each module, eigendecompose `A` and `B`, form the Kronecker eigenvalue matri
 grad_proj = U_B @ ((U_B.T @ grad @ U_A) * M.T) @ U_A.T
 ```
 
-Only two-dimensional target weight gradients are projected. There is no cache recomputation, cache merging, optimizer `reset_cache`, or momentum reprojection because the cache is fixed for the entire run.
+Only two-dimensional target weight gradients are projected. The K-FAC cache is built once before SFT and reused unchanged for the entire run.
 
 ## Training integration
 
