@@ -16,6 +16,15 @@ TASK_METRIC_PREFERENCES = {
     "mmlu": ["acc", "acc_norm", "exact_match"],
 }
 
+# PEFT methods that save as a full HuggingFace model (no LoRA adapter to merge).
+# For these methods, --lora points to a complete model directory with
+# config.json + model.safetensors that can be used directly.
+FULL_MODEL_PEFT_METHODS = {
+    "CurvatureDense",
+    "CrispEdit",
+    "FFT",
+}
+
 def resolve_base_model(
     peft,
     output_home,
@@ -45,6 +54,11 @@ def resolve_base_model(
         if not task:
             raise ValueError(f"--task is required for {peft} base model resolution")
         return os.path.realpath(f"{output_home}/output/{peft}-{model_abbr}-r{rank}-{task}")
+    if peft == "FFT":
+        # FFT saves the full model directly to output_path.
+        # FULL_MODEL_PEFT_METHODS already handles the no-merge path;
+        # resolve_base_model should return the original model (not used for FFT).
+        return model
     return model
 
 
@@ -98,7 +112,7 @@ def parse_args():
     parser.add_argument("--model_abbr", type=str, required=True)
     parser.add_argument("--lora", type=str, required=True, help="Trained adapter path")
     parser.add_argument("--peft", type=str, required=True)
-    parser.add_argument("--rank", type=int, required=True)
+    parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--task", type=str, default=None, help="Training task name")
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--output_home", type=str, default="./")
@@ -234,8 +248,18 @@ def main():
         print(f"[WK] GPUs:       {args.gpus}")
         print(f"[WK] Tasks:      {tasks}")
 
-        merge_adapter_to_temp(base_model_path, args.lora, temp_path)
-        results = run_lm_eval(temp_path, tasks, args.gpus, args.batch_size, args.limit)
+        if args.peft in FULL_MODEL_PEFT_METHODS:
+            # CurvatureDense / FFT: adapter_model is already a full
+            # HF model. Use it directly without any merge step.
+            print(f"[WK] {args.peft}: using pre-merged model directly from {args.lora}")
+            eval_model_path = args.lora
+            # No temp dir needed — skip the merge + save, avoid cleanup issues.
+            shutil.rmtree(temp_path, ignore_errors=True)
+        else:
+            merge_adapter_to_temp(base_model_path, args.lora, temp_path)
+            eval_model_path = temp_path
+
+        results = run_lm_eval(eval_model_path, tasks, args.gpus, args.batch_size, args.limit)
         world_knowledge, details = extract_world_knowledge_scores(results, tasks)
 
         # If running a subset (e.g., MMLU patch), merge into existing JSON
@@ -262,8 +286,9 @@ def main():
         print(f"[WK] Saved scores: {output_file}")
         print(f"[WK] Saved raw lm-eval results: {details_file}")
     finally:
-        shutil.rmtree(temp_path, ignore_errors=True)
-        print(f"[WK] Cleaned up {temp_path}")
+        if args.peft not in FULL_MODEL_PEFT_METHODS:
+            shutil.rmtree(temp_path, ignore_errors=True)
+            print(f"[WK] Cleaned up {temp_path}")
 
 
 if __name__ == "__main__":

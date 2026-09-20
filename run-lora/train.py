@@ -18,6 +18,7 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from utils.curvature_lora import CurvatureTrainer, apply_curvature_lora
 from utils.curvature_dense import CurvatureDenseTrainer, get_curvature_dense_model
 from utils.dense_peft import DenseConfig
+from utils.crispedit import CrispEditTrainer
 
 IGNORE_INDEX = -100
 logger = logging.getLogger(__name__)
@@ -80,6 +81,12 @@ class TrainingArguments(transformers.TrainingArguments):
     curvature_delta_tr: float = field(default=1e-12, metadata={"help": "Numerical stabilizer for trust-region denominator (must be > 0)."})
     ## CurvatureDense
     use_curvature_dense: Optional[bool] = field(default=False)
+    ## CrispEdit
+    use_crispedit: Optional[bool] = field(default=False)
+    crispedit_data_path: Optional[str] = field(default=None, metadata={"help": "Path to FineFineWeb JSONL (field 'text') used for the fixed CrispEdit K-FAC cache."})
+    crispedit_energy_ratio: float = field(default=0.9, metadata={"help": "Kronecker-eigenvalue energy ratio for the CrispEdit low-curvature mask."})
+    crispedit_collection_batch_size: int = field(default=1, metadata={"help": "Per-device batch size for CrispEdit K-FAC collection."})
+    crispedit_num_chunks: int = field(default=1, metadata={"help": "Number of target-module chunks for CrispEdit K-FAC collection."})
         
     # LoRA setting
     target_modules : Optional[str] = field(default="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj")
@@ -105,6 +112,12 @@ class TrainingArguments(transformers.TrainingArguments):
     dataset_split: str = field(default="train", metadata={"help": "(`['train', 'test', 'eval']`):"})
     dataset_field: List[str] = field(default=None, metadata={"help": "Fields of dataset input and output."})
     shuffle_dataset: Optional[bool] = field(default=False)
+
+    # Replay (pretraining-data mixing): optional raw-text JSONL (field "text")
+    # mixed into the training set as next-token-prediction examples. Empty /
+    # None = original behaviour (task data only).
+    replay_data_path: Optional[str] = field(default=None, metadata={"help": "Raw-text JSONL (field 'text') of pretraining data to mix into the training set for replay-style training. None = original behaviour."})
+    replay_num_samples: Optional[int] = field(default=None, metadata={"help": "Number of replay samples to take from replay_data_path. None = use all."})
     
 
 class SavePeftModelCallback(transformers.TrainerCallback):
@@ -154,10 +167,41 @@ def get_last_checkpoint(checkpoint_dir):
     return None  # first training
 
 
+def _is_zero3(trainer: transformers.Trainer) -> bool:
+    """Return True when running under DeepSpeed ZeRO stage 3."""
+    if not getattr(trainer, "is_deepspeed_enabled", False):
+        return False
+    try:
+        plugin = getattr(getattr(trainer, "accelerator", None), "state", None)
+        plugin = getattr(plugin, "deepspeed_plugin", None)
+        if plugin is not None and getattr(plugin, "zero_stage", None) is not None:
+            return int(plugin.zero_stage) == 3
+    except Exception:
+        pass
+    return False
+
+
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
-    """Collects the state dict and dump to disk."""
-    state_dict = trainer.model.state_dict()
+    """Collects the state dict and dump to disk.
+
+    Under DeepSpeed ZeRO-3, ``model.state_dict()`` returns only the local
+    shard of every parameter (a 7B model would be saved as ~KB), producing a
+    corrupt checkpoint that vLLM cannot load (shape asserts on vocab/embedding).
+    In that case we gather the consolidated 16-bit weights across all ranks
+    (a collective op) and only the main process writes them to disk.
+    """
+    if _is_zero3(trainer):
+        engine = getattr(trainer, "model_wrapped", None) or getattr(trainer, "deepspeed", None)
+        gather = getattr(engine, "_zero3_consolidated_16bit_state_dict", None)
+        if callable(gather):
+            state_dict = gather()  # collective — every rank must call it
+            if trainer.args.should_save:
+                cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+                del state_dict
+                trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+            return
     if trainer.args.should_save:
+        state_dict = trainer.model.state_dict()
         cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
@@ -220,6 +264,23 @@ def train_tokenize_function(examples, tokenizer, query, response):
     return data_dict
 
 
+def replay_tokenize_function(examples, tokenizer, model_max_length):
+    """Tokenize raw pretraining text for next-token prediction.
+
+    Replay data has no instruction/response split: the whole text is a
+    continuation, so labels equal input_ids (padding is masked to IGNORE_INDEX
+    by DataCollatorForSupervisedDataset).
+    """
+    texts = [t for t in examples.get("text", []) if isinstance(t, str) and t.strip()]
+    tokenized = tokenizer(
+        texts,
+        max_length=model_max_length,
+        truncation=True,
+        padding=False,
+    )
+    return {"input_ids": tokenized["input_ids"], "labels": tokenized["input_ids"]}
+
+
 def build_model(script_args, checkpoint_dir):
     if script_args.full_finetune:
         assert script_args.bits in [16, 32]
@@ -243,7 +304,7 @@ def build_model(script_args, checkpoint_dir):
     setattr(model, 'is_parallelizable', True)
     model.enable_input_require_grads()
 
-    if not script_args.full_finetune:
+    if not script_args.full_finetune and not script_args.use_crispedit:
         if script_args.bits < 16:
             model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=script_args.gradient_checkpointing)
 
@@ -338,7 +399,7 @@ def build_model(script_args, checkpoint_dir):
         if 'norm' in name or 'gate' in name:
             module = module.to(torch.float32)
 
-    if script_args.local_rank == 0 and not script_args.use_curvature_dense:
+    if script_args.local_rank == 0 and not script_args.use_curvature_dense and not script_args.full_finetune and not script_args.use_crispedit:
         model.print_trainable_parameters()
 
     return model
@@ -395,6 +456,19 @@ def train():
             raise ValueError("--curvature_data_path is required when --use_curvature_dense True.")
         if str(script_args.save_strategy).lower().split(".")[-1] != "no":
             raise ValueError("CurvatureDense requires --save_strategy no; only the final folded model is saved.")
+    if script_args.use_crispedit:
+        if script_args.full_finetune or script_args.bits not in [16, 32]:
+            raise ValueError("CrispEdit trains base projection weights in place: requires --full_finetune False and --bits 16/32.")
+        if script_args.use_curvature_lora or script_args.use_curvature_dense or script_args.use_loft:
+            raise ValueError("CrispEdit cannot be combined with CurvatureLoRA/CurvatureDense/LoFT.")
+        if resume_from_checkpoint_dir is not None:
+            raise ValueError("CrispEdit does not support resuming from unfinished checkpoints.")
+        if script_args.crispedit_data_path is None:
+            raise ValueError("--crispedit_data_path is required when --use_crispedit True.")
+        if str(script_args.save_strategy).lower().split(".")[-1] != "no":
+            raise ValueError("CrispEdit requires --save_strategy no.")
+        if str(script_args.lr_scheduler_type).lower().split(".")[-1] != "cosine":
+            raise ValueError("CrispEdit requires --lr_scheduler_type cosine.")
     model = build_model(script_args, resume_from_checkpoint_dir)
 
     all_training_dataset = []
@@ -449,6 +523,55 @@ def train():
             logger.info(f"Sample {index} of the training set: {train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
             logger.info(f"Sample {index} of the training set: {tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
 
+    # Optional replay mixing: tokenize raw pretraining text (next-token
+    # prediction), concatenate with the task dataset, then shuffle so the two
+    # streams interleave (independent mixing — no per-sequence concatenation).
+    if script_args.replay_data_path:
+        replay_raw = load_dataset(
+            "json", data_files=script_args.replay_data_path, split="train"
+        )
+        n_available = len(replay_raw)
+        n_replay = (
+            n_available
+            if script_args.replay_num_samples is None
+            else min(int(script_args.replay_num_samples), n_available)
+        )
+        if n_replay == 0:
+            raise ValueError(
+                f"Replay data '{script_args.replay_data_path}' selected 0 samples."
+            )
+        replay_raw = replay_raw.select(range(n_replay))
+        if script_args.local_rank == 0:
+            logger.info(
+                "Replay: mixing %d/%d samples from %s",
+                n_replay, n_available, script_args.replay_data_path,
+            )
+        # Rank 0 builds the (possibly fresh) Arrow cache first; other ranks wait.
+        if script_args.local_rank > 0:
+            torch.distributed.barrier()
+        replay_dataset = replay_raw.map(
+            replay_tokenize_function,
+            batched=True,
+            batch_size=3000,
+            num_proc=32,
+            remove_columns=replay_raw.column_names,
+            load_from_cache_file=True,
+            desc="Running tokenizer on replay dataset",
+            fn_kwargs={
+                "tokenizer": tokenizer,
+                "model_max_length": script_args.model_max_length,
+            },
+        )
+        if script_args.local_rank == 0:
+            torch.distributed.barrier()
+        train_dataset = concatenate_datasets([train_dataset, replay_dataset])
+        train_dataset = train_dataset.shuffle(seed=script_args.seed)
+        if script_args.local_rank == 0:
+            logger.info(
+                "Replay mixing: task=%d + replay=%d = %d samples",
+                len(train_dataset) - n_replay, n_replay, len(train_dataset),
+            )
+
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     data_module = dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
@@ -480,6 +603,20 @@ def train():
             curvature_num_chunks=script_args.curvature_num_chunks,
             **data_module,
         )
+    elif script_args.use_crispedit:
+        if script_args.use_loft:
+            raise ValueError("CrispEdit cannot be combined with LoFT optimizer mode.")
+        trainer = CrispEditTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            args=script_args,
+            target_modules=script_args.target_modules,
+            crispedit_data_path=script_args.crispedit_data_path,
+            crispedit_energy_ratio=script_args.crispedit_energy_ratio,
+            crispedit_collection_batch_size=script_args.crispedit_collection_batch_size,
+            crispedit_num_chunks=script_args.crispedit_num_chunks,
+            **data_module,
+        )
     elif script_args.use_loft:
         from utils.LoFT.utils import get_optimizer
         optimizer = get_optimizer(model, lr=script_args.learning_rate, LoFT=True)
@@ -494,7 +631,7 @@ def train():
     #     trainer = Trainer(model=model, processing_class=tokenizer, args=script_args, **data_module)
     else:
         trainer = Trainer(model=model, tokenizer=tokenizer, args=script_args, **data_module)
-    if not script_args.full_finetune and not script_args.use_curvature_dense:
+    if not script_args.full_finetune and not script_args.use_curvature_dense and not script_args.use_crispedit:
         trainer.add_callback(SavePeftModelCallback(tokenizer))
     trainer.train(resume_from_checkpoint=resume_from_checkpoint_dir)
     trainer.save_state()
@@ -516,6 +653,20 @@ def train():
         tokenizer.save_pretrained(script_args.output_dir)
     if script_args.full_finetune:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=script_args.output_dir)
+        # Save tokenizer alongside the full model for vLLM inference.
+        tokenizer.save_pretrained(script_args.output_dir)
+        # Write a "completed" mark so run_best_common.sh can detect finished FFT runs.
+        with open(os.path.join(script_args.output_dir, 'completed'), 'a'):
+            pass
+        # Also save training loss for FFT.
+        loss_file_path = os.path.join(script_args.output_dir, "train_loss.json")
+        training_logs = [
+            log for log in trainer.state.log_history
+            if "loss" in log
+        ]
+        with open(loss_file_path, 'w', encoding='utf-8') as f:
+            json.dump(training_logs, f, indent=2)
+        logger.info(f'Training losses saved to {loss_file_path}')
 
 
 if __name__ == "__main__":

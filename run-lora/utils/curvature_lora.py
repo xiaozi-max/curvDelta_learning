@@ -343,6 +343,11 @@ class KFACTracker:
             self.kfac_S[name].zero_()
             self.kfac_n[name] = 0
 
+    def release_module_state(self, name: str) -> None:
+        """Free one module's A/S accumulators once its projection cache is built."""
+        self.kfac_A[name] = torch.empty(0)
+        self.kfac_S[name] = torch.empty(0)
+
     def _make_fwd_hook(self, name: str):
         def hook(module, args):
             if not self._capturing or not torch.is_grad_enabled():

@@ -9,7 +9,7 @@ model="${ROOT_DIR}/models/meta-llama/Llama-2-7b-hf"   # model path
 model_abbr="Llama-2-7b"            # model name abbr
 data="pissa-dataset"               # data path
 task="metamath"                    # task name
-peft="LoRA"                        # peft method: LoRA, CurvatureLoRA, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT
+peft="LoRA"                        # peft method: LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT, FFT
 rank=128                           # lora rank
 lr=2e-5                            # learning rate
 bs=128                             # total (global) batch size you want to simulate
@@ -30,8 +30,14 @@ curvature_num_chunks=1  # KFAC chunk count (>1 stores matrices on CPU, lowering 
 curvature_alpha_tr=0.0  # trust-region alpha: ||Delta W_eff||_F <= alpha_tr * ||W_base||_F. 0 = disabled.
 curvature_delta_tr=1e-12  # numerical stabilizer for trust-region denominator
 curvature_lr_scheduler="cosine"  # lr_scheduler_type for CurvatureLoRA (cosine or constant_with_warmup)
+crispedit_data_path="./lora-dataset/corda/finefineweb_validation.jsonl"  # FineFineWeb JSONL (field 'text') for CrispEdit fixed K-FAC cache
+crispedit_energy_ratio=0.9  # Kronecker-eigenvalue energy ratio for the CrispEdit low-curvature mask
+crispedit_collection_batch_size=1  # per-device batch size for CrispEdit KFAC collection
+crispedit_num_chunks=1  # KFAC chunk count for CrispEdit (>1 stages matrices on CPU, lowering GPU VRAM)
 corda_data_path="./lora-dataset/corda/finefineweb_validation.jsonl"  # Local CorDA calibration JSONL (FineFineWeb)
 corda_num_samples=256                   # Number of local calibration samples for CorDA
+replay_data_path=""                     # Optional raw-text JSONL (field "text") of pretraining data to mix into training (replay). Empty = disabled (original behaviour).
+replay_num_samples=256                  # Number of replay samples to mix (used when replay_data_path is set)
 logging_steps=20  # log every N steps to reduce terminal spam
 
 # =====================
@@ -46,7 +52,7 @@ Options:
   --model_abbr NAME  Model abbreviation name (default: $model_abbr)
   --data PATH        Data path (default: $data)
   --task NAME        Task name, e.g., metamath, python, conversation (default: "$task")
-  --peft NAME        PEFT method: LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
+  --peft NAME        PEFT method: LoRA, CurvatureLoRA, CurvatureDense, CrispEdit, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT, FFT (default: "$peft")
   --rank INT         LoRA rank (default: $rank)
   --lr FLOAT         Learning rate (default: $lr)
   --bs INT           Global batch size (default: $bs)
@@ -66,8 +72,14 @@ Options:
   --curvature_alpha_tr FLOAT  Trust-region alpha (0=disabled) (default: $curvature_alpha_tr)
   --curvature_delta_tr FLOAT  Trust-region stabilizer (default: $curvature_delta_tr)
   --curvature_lr_scheduler STR  LR scheduler for CurvatureLoRA: cosine or constant_with_warmup (default: $curvature_lr_scheduler)
+  --crispedit_data_path PATH  FineFineWeb JSONL (field 'text') for CrispEdit fixed K-FAC cache (default: $crispedit_data_path)
+  --crispedit_energy_ratio FLOAT  Kronecker energy ratio for CrispEdit mask (default: $crispedit_energy_ratio)
+  --crispedit_collection_batch_size INT  CrispEdit KFAC collection batch size (default: $crispedit_collection_batch_size)
+  --crispedit_num_chunks INT  CrispEdit KFAC chunk count (default: $crispedit_num_chunks)
   --corda_data_path PATH  Local CorDA calibration data path (default: $corda_data_path)
   --corda_num_samples INT Number of CorDA calibration samples (default: $corda_num_samples)
+  --replay_data_path PATH  Raw-text JSONL (field "text") of pretraining data to mix into training. Empty = disabled (default: $replay_data_path)
+  --replay_num_samples INT Number of replay samples to mix (default: $replay_num_samples)
   --help             Show this help message and exit
 EOF
 }
@@ -76,7 +88,7 @@ EOF
 # parse long options
 # =====================
 TEMP=$(getopt -o '' \
-  --long model:,model_abbr:,data:,task:,peft:,rank:,lr:,bs:,per_bs:,model_max_length:,gpus:,trial_id:,master_port:,timestamp:,output_home:,output_path:,gralora_k:,randlora_alpha:,curvature_data_path:,curvature_energy_ratio:,curvature_num_chunks:,curvature_alpha_tr:,curvature_delta_tr:,curvature_lr_scheduler:,corda_data_path:,corda_num_samples:,help \
+  --long model:,model_abbr:,data:,task:,peft:,rank:,lr:,bs:,per_bs:,model_max_length:,gpus:,trial_id:,master_port:,timestamp:,output_home:,output_path:,gralora_k:,randlora_alpha:,curvature_data_path:,curvature_energy_ratio:,curvature_num_chunks:,curvature_alpha_tr:,curvature_delta_tr:,curvature_lr_scheduler:,crispedit_data_path:,crispedit_energy_ratio:,crispedit_collection_batch_size:,crispedit_num_chunks:,corda_data_path:,corda_num_samples:,replay_data_path:,replay_num_samples:,help \
   -n "$0" -- "$@")
 if [ $? != 0 ]; then
     echo "Error parsing options." >&2
@@ -109,8 +121,14 @@ while true; do
     --curvature_alpha_tr) curvature_alpha_tr="$2"; shift 2 ;;
     --curvature_delta_tr) curvature_delta_tr="$2"; shift 2 ;;
     --curvature_lr_scheduler) curvature_lr_scheduler="$2"; shift 2 ;;
+    --crispedit_data_path) crispedit_data_path="$2"; shift 2 ;;
+    --crispedit_energy_ratio) crispedit_energy_ratio="$2"; shift 2 ;;
+    --crispedit_collection_batch_size) crispedit_collection_batch_size="$2"; shift 2 ;;
+    --crispedit_num_chunks) crispedit_num_chunks="$2"; shift 2 ;;
     --corda_data_path) corda_data_path="$2"; shift 2 ;;
     --corda_num_samples) corda_num_samples="$2"; shift 2 ;;
+    --replay_data_path) replay_data_path="$2"; shift 2 ;;
+    --replay_num_samples) replay_num_samples="$2"; shift 2 ;;
     --help)         show_help; exit 0 ;;
     --) shift; break ;;
     *) echo "Internal error!"; exit 1 ;;
@@ -118,13 +136,23 @@ while true; do
 done
 
 # =====================
+# optional replay mixing (forwarded to train.py only when a path is given,
+# so experiments without mixed data run exactly as before)
+# =====================
+_replay_train_args=()
+if [[ -n "$replay_data_path" ]]; then
+  _replay_train_args+=(--replay_data_path "$replay_data_path")
+  _replay_train_args+=(--replay_num_samples "$replay_num_samples")
+fi
+
+# =====================
 # validations (types & allowed sets)
 # =====================
-if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|CurvatureDense|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
-  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
+if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|CurvatureDense|CrispEdit|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT|FFT)$ ]]; then
+  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, CurvatureDense, CrispEdit, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT, FFT}." >&2
   exit 2
 fi
-if [[ ! "$rank" =~ ^[0-9]+$ ]]; then
+if [[ "$peft" != "FFT" ]] && [[ ! "$rank" =~ ^[0-9]+$ ]]; then
   echo "Error: --rank must be an integer." >&2; exit 2
 fi
 if [[ ! "$bs" =~ ^[0-9]+$ ]]; then
@@ -234,7 +262,11 @@ echo "Model: $model"
 echo "Data: $data"
 echo "Task: $task"
 echo "PEFT: $peft"
-echo "Rank: $rank"
+if [[ "$peft" == "FFT" ]]; then
+  echo "FFT (Full Fine-Tuning) — no LoRA rank/alpha"
+else
+  echo "Rank: $rank"
+fi
 echo "Number of train epochs: $num_train_epochs"
 echo "Learning rate: $lr"
 echo "Batch size (global target): $bs"
@@ -257,9 +289,17 @@ if [[ "$peft" == "CurvatureDense" ]]; then
   echo "Curvature Energy Ratio: $curvature_energy_ratio"
   echo "Curvature LR Scheduler: $curvature_lr_scheduler"
 fi
+if [[ "$peft" == "CrispEdit" ]]; then
+  echo "CrispEdit Data Path: $crispedit_data_path"
+  echo "CrispEdit Energy Ratio: $crispedit_energy_ratio"
+  echo "CrispEdit LR Scheduler: cosine (fixed)"
+fi
 if [[ "$peft" == Corda-* ]]; then
   echo "CorDA Data Path: $corda_data_path"
   echo "CorDA Num Samples: $corda_num_samples"
+fi
+if [[ "$peft" == "FFT" ]]; then
+  echo "Full Fine-Tuning (FFT) — no LoRA config; model saved directly to output_path."
 fi
 echo "Time stamp: $timestamp"
 echo "Trial ID: $trial_id"
@@ -309,7 +349,8 @@ if [[ "$peft" == "PiSSA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "MiLoRA" ]]; then
   res_model=$(readlink -m "${output_home}/output/MiLoRA-${model_abbr}-r${rank}")
@@ -350,7 +391,8 @@ elif [[ "$peft" == "MiLoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "LoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -379,7 +421,8 @@ elif [[ "$peft" == "LoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "CurvatureLoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -416,16 +459,26 @@ elif [[ "$peft" == "CurvatureLoRA" ]]; then
     --report_to "wandb" \
     --trial_id $trial_id \
     --logging_steps $logging_steps \
-    --gradient_checkpointing True
+    --gradient_checkpointing True \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "CurvatureDense" ]]; then
+ _curvature_dense_ds_config="configs/ds_config_zero3_no_offload.json"
+  if (( world_size >= 2 )); then
+    # CurvatureDense with full-rank ΔW needs more memory than LoRA.
+    # For multi-GPU (typically 7B models), use ZeRO-3 with **optimizer-only**
+    # offload: params stay sharded on GPU (fast), only AdamW states go to CPU.
+    # Full param+optim offload (ds_config_zero3.json) is ~2-3x slower because
+    # every forward/backward fetches params from CPU.
+    _curvature_dense_ds_config="configs/ds_config_zero3_offload_optim.json"
+  fi
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
     --use_curvature_dense True \
     --curvature_data_path "$curvature_data_path" \
     --curvature_energy_ratio "$curvature_energy_ratio" \
     --curvature_collection_batch_size 1 \
     --curvature_num_chunks "$curvature_num_chunks" \
-    --deepspeed configs/ds_config_zero2_no_offload.json \
+    --deepspeed "$_curvature_dense_ds_config" \
     --model_name_or_path "$model" \
     --full_finetune False \
     --bf16 \
@@ -447,7 +500,8 @@ elif [[ "$peft" == "CurvatureDense" ]]; then
     --report_to "wandb" \
     --trial_id $trial_id \
     --logging_steps $logging_steps \
-    --gradient_checkpointing True
+    --gradient_checkpointing True \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == Corda-* ]]; then
   corda_method="kpm"
@@ -500,7 +554,8 @@ elif [[ "$peft" == Corda-* ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "DoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -530,7 +585,8 @@ elif [[ "$peft" == "DoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "OLoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -560,7 +616,8 @@ elif [[ "$peft" == "OLoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "LoRA-GA" ]]; then
   res_model=$(readlink -m "${output_home}/output/LoRA-GA-${model_abbr}-r${rank}-${task_base}")
@@ -607,7 +664,8 @@ elif [[ "$peft" == "LoRA-GA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "InitAB" ]]; then
   initAB_res_model=$(readlink -m "${output_home}/output/InitAB-${model_abbr}-r${rank}-${timestamp}")
@@ -639,7 +697,8 @@ elif [[ "$peft" == "InitAB" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "GraLoRA" ]]; then
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -670,7 +729,8 @@ elif [[ "$peft" == "GraLoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "RandLoRA" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -699,7 +759,8 @@ elif [[ "$peft" == "RandLoRA" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
 
 elif [[ "$peft" == "LoFT" ]]; then
   deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
@@ -729,10 +790,94 @@ elif [[ "$peft" == "LoFT" ]]; then
     --lr_scheduler_type "cosine" \
     --report_to "wandb" \
     --trial_id $trial_id \
-    --logging_steps $logging_steps
+    --logging_steps $logging_steps \
+    "${_replay_train_args[@]}"
+
+elif [[ "$peft" == "CrispEdit" ]]; then
+  # CrispEdit updates every target projection weight in place (not a PEFT
+  # adapter), so a 7B base model trains ~6.5B parameters: ZeRO-2 would keep an
+  # fp32 master copy of all of them on every rank, which alone is ~26GB.
+  # ZeRO-3 shards params + grads + optimizer states. `offload_optimizer` moves
+  # the AdamW states (and the fp32 masters) to the CPU, which is the recipe this
+  # repo already uses for 7B CurvatureDense; the tighter reduce/prefetch/max-live
+  # buffers in that config bound the extra ZeRO-3 buffers. Its optimizer block is
+  # required for the offload and it deliberately has no scheduler block, so the
+  # Hugging Face cosine schedule is used (a DeepSpeed "scheduler" key would make
+  # Transformers build a DummyScheduler and let WarmupLR replace cosine).
+  # If VRAM is still short, `configs/ds_config_zero3.json` adds param offload
+  # (~2-3x slower per the CurvatureDense comment).
+  _ds_config="configs/ds_config_zero2_no_offload.json"
+  if (( world_size >= 2 )); then
+    _ds_config="configs/ds_config_zero3_crispedit.json"
+  fi
+  deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
+    --deepspeed "$_ds_config" \
+    --use_crispedit True \
+    --crispedit_data_path "$crispedit_data_path" \
+    --crispedit_energy_ratio "$crispedit_energy_ratio" \
+    --crispedit_collection_batch_size "$crispedit_collection_batch_size" \
+    --crispedit_num_chunks "$crispedit_num_chunks" \
+    --target_modules "q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj" \
+    --model_name_or_path "$model" \
+    --full_finetune False \
+    --bf16 \
+    --data_path "$data" \
+    --sub_task "$task" \
+    --dataset_split train \
+    --dataset_field instruction output \
+    --output_dir "$output_path" \
+    --num_train_epochs "$num_train_epochs" \
+    --model_max_length "$model_max_length" \
+    --per_device_train_batch_size "$per_bs" \
+    --gradient_accumulation_steps "$gradient_accumulation_steps" \
+    --learning_rate "$lr" \
+    --save_strategy "no" \
+    --weight_decay 0.0 \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --report_to "wandb" \
+    --trial_id $trial_id \
+    --logging_steps $logging_steps \
+    --gradient_checkpointing True \
+    "${_replay_train_args[@]}"
+
+elif [[ "$peft" == "FFT" ]]; then
+  # ZeRO-3 + optimizer offload for 7B models, ZeRO-2 for small models (0.6B/1B).
+  # - no offload: ~30-35GB/GPU on 4x40GB — too tight, OOMs with other procs.
+  # - optim offload: ~10-15GB/GPU, only ~30-50% slower — recommended.
+  # - param+optim offload: ~5GB but ~60h/epoch — too slow.
+  _ds_config="configs/ds_config_zero2_no_offload.json"
+  if [[ "$model_abbr" == Llama-* ]] || [[ "$model_abbr" == llama-* ]]; then
+    _ds_config="configs/ds_config_zero3_no_offload.json"
+  fi
+
+  deepspeed --master_port=$master_port --include=localhost:"$gpus" train.py \
+    --deepspeed "$_ds_config" \
+    --model_name_or_path "$model" \
+    --full_finetune True \
+    --bf16 \
+    --data_path "$data" \
+    --sub_task "$task" \
+    --dataset_split train \
+    --dataset_field instruction output \
+    --output_dir "$output_path" \
+    --num_train_epochs "$num_train_epochs" \
+    --model_max_length "$model_max_length" \
+    --per_device_train_batch_size "$per_bs" \
+    --gradient_accumulation_steps "$gradient_accumulation_steps" \
+    --learning_rate "$lr" \
+    --save_strategy "no" \
+    --weight_decay 0.0 \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --report_to "wandb" \
+    --trial_id $trial_id \
+    --logging_steps $logging_steps \
+    --gradient_checkpointing True \
+    "${_replay_train_args[@]}"
 
 else
   echo "Error: Unsupported PEFT method: $peft" >&2
-  echo "Supported methods: LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT" >&2
+  echo "Supported methods: LoRA, CurvatureLoRA, CurvatureDense, CrispEdit, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT, FFT" >&2
   exit 1
 fi

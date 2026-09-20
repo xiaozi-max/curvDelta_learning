@@ -56,34 +56,6 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================================== #
-# _DisabledDenseAdapterModel — disables Dense adapters for ref-model forward   #
-# =========================================================================== #
-# curvature_lora's _DisabledAdapterModel uses model.disable_adapter() which is
-# a PeftModel method NOT available on raw DenseModel.  We provide a Dense-
-# specific equivalent using disable_adapter_layers() / enable_adapter_layers().
-
-class _DisabledDenseAdapterModel:
-    """Wraps a DenseModel so that __call__ runs with adapters disabled."""
-
-    def __init__(self, model):
-        object.__setattr__(self, "_model", model)
-
-    def __call__(self, *args, **kwargs):
-        was_training = self._model.training
-        self._model.eval()
-        try:
-            self._model.disable_adapter_layers()
-            return self._model(*args, **kwargs)
-        finally:
-            self._model.enable_adapter_layers()
-            if was_training:
-                self._model.train()
-
-    def __getattr__(self, name):
-        return getattr(self._model, name)
-
-
-# =========================================================================== #
 # CurvatureDense — DenseVariant that applies bilateral projection             #
 # =========================================================================== #
 
@@ -147,7 +119,10 @@ class CurvatureDense(DenseVariant):
         if U_in_bar.shape[1] > 0:
             x_projected = x_projected - (x_projected @ U_in_bar) @ U_in_bar.T
 
+        # ZeRO-3 gathers delta through the external-parameter hook registered
+        # for the owning DenseLinear before this forward begins.
         update = F.linear(x_projected, delta)
+
         if U_out_bar.shape[1] > 0:
             update = update - (update @ U_out_bar) @ U_out_bar.T
 
@@ -225,6 +200,9 @@ class CurvatureDenseCallback(TrainerCallback):
         self.trainer = trainer
 
     def on_train_begin(self, args, state, control, **kwargs):
+        # ZeRO-3 is now initialised — register dense_delta params so
+        # DeepSpeed auto-gathers them before DenseLinear.forward.
+        self.trainer._register_zero3_external_params()
         self.trainer.curvature_on_train_begin()
 
     def on_train_end(self, args, state, control, **kwargs):
@@ -301,28 +279,64 @@ class CurvatureDenseTrainerMixin:
         self.args.remove_unused_columns = False
 
         # -- setup ----------------------------------------------------------- #
-        self._fail_on_zero3()
         self.add_callback(CurvatureDenseCallback(self))
         self._setup_curvature()
 
-    # -- DeepSpeed guard -----------------------------------------------------
+    # -- ZeRO helpers --------------------------------------------------------
 
-    def _fail_on_zero3(self) -> None:
+    def _register_zero3_external_params(self) -> None:
+        """Register dense_delta params for ZeRO-3 auto-gather.
+
+        Parameters inside ``nn.ParameterDict`` are not automatically
+        all-gathered by DeepSpeed ZeRO-3 because ``ParameterDict.__getitem__``
+        bypasses the module-level ``__getattr__`` hook.  This method tells
+        DeepSpeed to treat each ``dense_delta[adapter]`` as an external
+        parameter of its owning ``DenseLinear`` module, so ZeRO-3 gathers it
+        before ``DenseLinear.forward`` and reduce-scatters gradients afterward.
+        """
         if not getattr(self, "is_deepspeed_enabled", False):
             return
-        plugin = getattr(getattr(self, "accelerator", None), "state", None)
-        plugin = getattr(plugin, "deepspeed_plugin", None)
-        config = getattr(plugin, "deepspeed_config", None)
-        if not isinstance(config, dict):
+        try:
+            import deepspeed
+
+            register_external_parameter = getattr(
+                deepspeed.zero, "register_external_parameter", None
+            )
+            if register_external_parameter is None:
+                from deepspeed.runtime.zero.partition_parameters import (
+                    register_external_parameter,
+                )
+        except (ImportError, AttributeError):
             raise RuntimeError(
-                "CurvatureDense could not inspect DeepSpeed config."
+                "CurvatureDense requires DeepSpeed external-parameter "
+                "registration under ZeRO-3, but this DeepSpeed installation "
+                "does not expose register_external_parameter."
             )
-        stage = config.get("zero_optimization", {}).get("stage")
-        if str(stage) == "3":
-            raise ValueError(
-                "CurvatureDense supports DeepSpeed ZeRO-2 only; "
-                "ZeRO-3 is intentionally unsupported."
-            )
+
+        registered = 0
+        for name, module in self._target_modules.items():
+            adapter_name = self._adapter_names[name]
+            delta = module.dense_delta[adapter_name]
+            expected_shape = (module.out_features, module.in_features)
+            actual_shape = tuple(getattr(delta, "ds_shape", delta.shape))
+            if actual_shape != expected_shape:
+                raise RuntimeError(
+                    f"CurvatureDense initialized an invalid delta for {name}: "
+                    f"expected {expected_shape}, got local={tuple(delta.shape)}, "
+                    f"ds_shape={actual_shape}, "
+                    f"ds_numel={getattr(delta, 'ds_numel', None)}."
+                )
+            if not delta.requires_grad:
+                raise RuntimeError(
+                    f"CurvatureDense delta for {name} is unexpectedly frozen."
+                )
+            register_external_parameter(module, delta)
+            registered += 1
+
+        logger.info(
+            "CurvatureDense: registered %d external parameters for ZeRO-3.",
+            registered,
+        )
 
     # -- module discovery ----------------------------------------------------
 
@@ -404,11 +418,16 @@ class CurvatureDenseTrainerMixin:
         return inputs["attention_mask"][..., 1:].bool()
 
     def _compute_curvature_fisher_loss(self, model, inputs):
-        """KL-style Fisher loss using reference model for target sampling."""
-        if self.ref_model is None:
-            self.ref_model = _DisabledDenseAdapterModel(model)
+        """KL-style Fisher loss using reference model for target sampling.
+
+        During bootstrap (pre-DeepSpeed, adapter disabled) ``self.ref_model``
+        is pre-set to the same *model* so that both reference and student
+        run on the base model.  During any later phase the ref_model is
+        provided externally.
+        """
+        ref = self.ref_model if self.ref_model is not None else model
         with torch.no_grad():
-            ref_outputs = self.ref_model(**inputs)
+            ref_outputs = ref(**inputs)
             ref_logits = ref_outputs.logits[..., :-1, :] / FISHER_TEMPERATURE
             ref_probs = F.softmax(ref_logits, dim=-1)
 
@@ -433,81 +452,100 @@ class CurvatureDenseTrainerMixin:
             flat_student_logits, sampled_targets, reduction="mean"
         )
 
-    # -- KFAC collection (factorised per chunk) ------------------------------
+    # -- KFAC collection (adapter disabled, after DeepSpeed init) ------------
 
     def _collect_factors(self) -> None:
-        """Collect KFAC A/S factors and compute projection bases.
+        """Collect KFAC with Dense adapters **disabled**.
 
-        Factorised per chunk: each chunk's accumulators live on GPU only
-        during its collection pass, keeping VRAM bounded.
+        This runs from ``on_train_begin`` after DeepSpeed has installed its
+        module hooks, so base Linear weights are gathered by ZeRO-3.  Dense
+        adapters remain disabled for the Fisher/KFAC pass because Delta W is
+        zero at initialization and is not part of the curvature estimate.
         """
+        logger.info(
+            "CurvatureDense: collecting KFAC projections from %s "
+            "(adapter disabled, post-DeepSpeed init)",
+            self.curvature_data_path,
+        )
         tracker = self._tracker
         self._local_projections = {}
-        is_main = self.accelerator.is_main_process
+        is_main = self.args.process_index == 0
 
-        for chunk_idx in range(tracker.num_chunks):
-            self._curvature_fisher_generator = None
-            tracker.activate_chunk(chunk_idx)
-            tracker.clear_accumulators()
-            tracker.install_hooks()
-            self.model.eval()
+        # Use the same (adapter-disabled) model for reference sampling.
+        self.ref_model = self.model
 
-            chunk_names = tracker.active_module_names()
-            desc = (
-                f"Collecting CurvatureDense KFAC factors "
-                f"({chunk_idx + 1}/{tracker.num_chunks})"
-                if tracker.num_chunks > 1
-                else "Collecting CurvatureDense KFAC factors"
-            )
+        # Disable the exact DenseLinear modules tracked by KFAC. Wrapper-level
+        # PEFT delegation is unreliable after DeepSpeed wraps the trainer model.
+        for module in self._target_modules.values():
+            module.enable_adapters(False)
+        try:
+            for chunk_idx in range(tracker.num_chunks):
+                self._curvature_fisher_generator = None
+                tracker.activate_chunk(chunk_idx)
+                tracker.clear_accumulators()
+                tracker.install_hooks()
+                self.model.eval()
 
-            try:
-                pbar = tqdm(
-                    self._curvature_loader,
-                    desc=desc,
-                    disable=not is_main,
-                    dynamic_ncols=True,
+                chunk_names = tracker.active_module_names()
+                desc = (
+                    f"Bootstrapping CurvatureDense KFAC "
+                    f"({chunk_idx + 1}/{tracker.num_chunks})"
+                    if tracker.num_chunks > 1
+                    else "Bootstrapping CurvatureDense KFAC"
                 )
-                for batch in pbar:
-                    batch = self._prepare_inputs(batch)
-                    self.model.zero_grad(set_to_none=True)
-                    with tracker.capture(batch["attention_mask"]):
-                        loss = self._compute_curvature_fisher_loss(
-                            self.model, batch
+
+                try:
+                    pbar = tqdm(
+                        self._curvature_loader,
+                        desc=desc,
+                        disable=not is_main,
+                        dynamic_ncols=True,
+                    )
+                    for batch in pbar:
+                        batch = self._prepare_inputs(batch)
+                        self.model.zero_grad(set_to_none=True)
+                        with tracker.capture(batch["attention_mask"]):
+                            loss = self._compute_curvature_fisher_loss(
+                                self.model, batch
+                            )
+                            with self.accelerator.no_sync(self.model):
+                                self.accelerator.backward(loss)
+                        self.model.zero_grad(set_to_none=True)
+                        pbar.set_postfix({"fisher_loss": f"{loss.item():.4f}"})
+                finally:
+                    tracker.remove_hooks()
+                    self.model.train()
+
+                # Normalise and compute projections per module in chunk
+                for name in chunk_names:
+                    if tracker.kfac_n[name] == 0:
+                        raise ValueError(
+                            f"CurvatureDense collected no valid tokens "
+                            f"for module {name}."
                         )
-                        with self.accelerator.no_sync(self.model):
-                            self.accelerator.backward(loss)
-                    self.model.zero_grad(set_to_none=True)
-                    pbar.set_postfix({"fisher_loss": f"{loss.item():.4f}"})
-            finally:
-                tracker.remove_hooks()
-                self.model.train()
+                    tracker.kfac_A[name] /= tracker.kfac_n[name]
+                    tracker.kfac_S[name] /= tracker.kfac_n[name]
 
-            # Normalise and compute projections per module in chunk
-            for name in chunk_names:
-                if tracker.kfac_n[name] == 0:
-                    raise ValueError(
-                        f"CurvatureDense collected no valid tokens "
-                        f"for module {name}."
+                    U_in = compute_projection_cache(
+                        tracker.kfac_A[name],
+                        energy_ratio=self.curvature_energy_ratio,
                     )
-                tracker.kfac_A[name] /= tracker.kfac_n[name]
-                tracker.kfac_S[name] /= tracker.kfac_n[name]
-
-                U_in = compute_projection_cache(
-                    tracker.kfac_A[name],
-                    energy_ratio=self.curvature_energy_ratio,
-                )
-                U_out = compute_projection_cache(
-                    tracker.kfac_S[name],
-                    energy_ratio=self.curvature_energy_ratio,
-                )
-                if U_in.shape[1] == 0 and U_out.shape[1] == 0:
-                    raise ValueError(
-                        f"CurvatureDense produced empty projection bases "
-                        f"for module {name}; KFAC factors have zero energy."
+                    U_out = compute_projection_cache(
+                        tracker.kfac_S[name],
+                        energy_ratio=self.curvature_energy_ratio,
                     )
-                self._local_projections[name] = (U_in.cpu(), U_out.cpu())
+                    if U_in.shape[1] == 0 and U_out.shape[1] == 0:
+                        raise ValueError(
+                            f"CurvatureDense produced empty projection bases "
+                            f"for module {name}; KFAC factors have zero energy."
+                        )
+                    self._local_projections[name] = (U_in.cpu(), U_out.cpu())
 
-            tracker.deactivate_chunk(chunk_idx)
+                tracker.deactivate_chunk(chunk_idx)
+        finally:
+            for module in self._target_modules.values():
+                module.enable_adapters(True)
+            self.ref_model = None
 
     # -- projection application ----------------------------------------------
 
@@ -529,8 +567,12 @@ class CurvatureDenseTrainerMixin:
             raise
 
     def _distributed_apply_projections(self) -> None:
-        """Broadcast projections so every rank holds identical buffers."""
-        device = self.accelerator.device
+        """Broadcast projections so every rank holds identical buffers.
+
+        Uses ``torch.distributed.all_reduce`` because collection runs after
+        DeepSpeed has initialized the process group.
+        """
+        device = torch.cuda.current_device()
         rank = self.args.process_index
         world_size = self.args.world_size
         module_names = list(self._target_modules.keys())
@@ -541,9 +583,9 @@ class CurvatureDenseTrainerMixin:
             if i % world_size == rank:
                 U_in, U_out = self._local_projections[name]
                 shapes[i, 0], shapes[i, 1] = U_in.shape[1], U_out.shape[1]
-        shapes = self.accelerator.reduce(shapes, reduction="sum")
+        torch.distributed.all_reduce(shapes, op=torch.distributed.ReduceOp.SUM)
 
-        # Phase 2: share projections, write buffers
+        # Phase 2: all-reduce projections, write buffers
         for i, name in enumerate(module_names):
             owner = i % world_size
             module = self._target_modules[name]
@@ -563,8 +605,8 @@ class CurvatureDenseTrainerMixin:
                     module.in_features, in_cols,
                     dtype=torch.float32, device=device,
                 )
-            buf_in = self.accelerator.reduce(buf_in, reduction="sum").to(ref)
-            module._buffers[f"U_in_bar_{adapter_name}"] = buf_in
+            torch.distributed.all_reduce(buf_in, op=torch.distributed.ReduceOp.SUM)
+            module._buffers[f"U_in_bar_{adapter_name}"] = buf_in.to(ref)
 
             if owner == rank:
                 buf_out = self._local_projections[name][1].to(
@@ -575,21 +617,57 @@ class CurvatureDenseTrainerMixin:
                     module.out_features, out_cols,
                     dtype=torch.float32, device=device,
                 )
-            buf_out = self.accelerator.reduce(buf_out, reduction="sum").to(ref)
-            module._buffers[f"U_out_bar_{adapter_name}"] = buf_out
+            torch.distributed.all_reduce(buf_out, op=torch.distributed.ReduceOp.SUM)
+            module._buffers[f"U_out_bar_{adapter_name}"] = buf_out.to(ref)
 
             if owner == rank:
                 del self._local_projections[name]
 
         self._local_projections.clear()
 
+    # -- state-dict gathering (ZeRO-3 safe) ----------------------------------
+
+    def _gather_full_state_dict(self) -> Dict[str, torch.Tensor]:
+        """Return the full, unsharded model state dict (ZeRO-3-safe).
+
+        Under DeepSpeed ZeRO-3 every parameter is partitioned across ranks, so
+        ``self.model.state_dict()`` yields shards. Saving those produces a
+        broken checkpoint (observed: 4.5MB for a 7B model that should be
+        ~13GB) and downstream loaders (e.g. vLLM) fail with shape asserts.
+        This mirrors HF Trainer's own ZeRO-3 save path: consolidate the 16-bit
+        weights across ranks before exporting.
+        """
+        if not self._is_zero3(self):
+            return self.model.state_dict()
+
+        # 1) Prefer the DeepSpeed engine's consolidated 16-bit gather (the one
+        #    HF Trainer uses when saving under ZeRO-3). All ranks must call it.
+        engine = getattr(self, "model_wrapped", None) or getattr(self, "deepspeed", None)
+        gather = getattr(engine, "_zero3_consolidated_16bit_state_dict", None)
+        if callable(gather):
+            try:
+                gathered = gather()
+                if gathered:
+                    return gathered
+            except Exception:
+                logger.exception(
+                    "CurvatureDense: ZeRO-3 consolidated state dict failed, "
+                    "falling back to manual per-parameter gather."
+                )
+
+        # 2) Fallback: gather each parameter explicitly. This is a collective
+        #    across ranks; the full tensor is available on every rank inside
+        #    the context, and only the main process uses the result.
+        import deepspeed
+        state_dict: Dict[str, torch.Tensor] = {}
+        for name, param in self.model.named_parameters():
+            with deepspeed.zero.GatheredParameters(param, modifier_rank=0):
+                state_dict[name] = param.data.detach().to("cpu")
+        return state_dict
+
     # -- train lifecycle -----------------------------------------------------
 
     def curvature_on_train_begin(self):
-        logger.info(
-            "CurvatureDense: collecting static KFAC projections from %s",
-            self.curvature_data_path,
-        )
         self._collect_factors()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -600,7 +678,8 @@ class CurvatureDenseTrainerMixin:
     def curvature_on_train_end(self):
         self._tracker.remove_hooks()
         self._fold_projections_into_dense_weights()
-        # Save the merged full model + tokenizer (equivalent to SavePeftModelCallback.on_train_end)
+        # Save the merged full model + tokenizer (equivalent to SavePeftModelCallback.on_train_end).
+        # Under ZeRO-3 model.state_dict() is sharded, so gather full weights first.
         peft_model_path = os.path.join(self.args.output_dir, "adapter_model")
         logger.info("CurvatureDense: saving merged model to %s", peft_model_path)
         DensePeftModelForCausalLM.save_pretrained_dense(
@@ -608,6 +687,7 @@ class CurvatureDenseTrainerMixin:
             peft_model_path,
             safe_serialization=True,
             is_main_process=self.accelerator.is_main_process,
+            state_dict=self._gather_full_state_dict(),
         )
         tokenizer = self._tokenizer()
         if self.accelerator.is_main_process:
@@ -619,18 +699,48 @@ class CurvatureDenseTrainerMixin:
 
     # -- post-training folding -----------------------------------------------
 
+    @staticmethod
+    def _is_zero3(trainer) -> bool:
+        """Check whether the trainer is running under DeepSpeed ZeRO-3.
+
+        Under the HF Trainer, ``deepspeed_plugin.deepspeed_config`` is an
+        ``HfTrainerDeepSpeedConfig`` object, NOT a plain dict.  The previous
+        ``isinstance(config, dict)`` check therefore silently returned False
+        and the model was saved from sharded ``state_dict()`` (a 7B model
+        became ~KB, breaking vLLM loading).  Use the plugin's ``zero_stage``
+        property instead.
+        """
+        if not getattr(trainer, "is_deepspeed_enabled", False):
+            return False
+        try:
+            plugin = getattr(getattr(trainer, "accelerator", None), "state", None)
+            plugin = getattr(plugin, "deepspeed_plugin", None)
+            if plugin is not None and getattr(plugin, "zero_stage", None) is not None:
+                return int(plugin.zero_stage) == 3
+        except Exception:
+            pass
+        return False
+
     def _fold_projections_into_dense_weights(self) -> None:
         """Fold projection buffers into dense_delta, removing CurvatureDense.
 
         After folding, each module becomes a plain Dense adapter with the
         curvature projection baked into ΔW.  This ensures that saved
         checkpoints load correctly as standard Dense adapters.
+
+        ZeRO-3 safety: the full bilateral projection and in-place ``copy_``
+        are performed inside ``GatheredParameters`` so the parameter is
+        fully assembled for the duration of the operation.  Returning a
+        reference to ``param.data`` from inside the context manager (as the
+        previous ``_gather_param_if_zero3`` did) produces a dangling alias
+        because the parameter is re-sharded on context exit.
         """
         logger.info(
             "CurvatureDense: folding projection buffers into "
             "dense_delta before saving."
         )
         folded = 0
+        is_zero3 = self._is_zero3(self)
         with torch.no_grad():
             for name, module in self._target_modules.items():
                 adapter_name = self._adapter_names[name]
@@ -649,12 +759,26 @@ class CurvatureDenseTrainerMixin:
                     )
 
                 # Apply bilateral projection: (I-U_outU_out^T)·ΔW·(I-U_inU_in^T)
-                projected = delta
-                if U_out.shape[1] > 0:
-                    projected = projected - U_out @ (U_out.T @ projected)
-                if U_in.shape[1] > 0:
-                    projected = projected - (projected @ U_in) @ U_in.T
-                delta.copy_(projected)
+                # Under ZeRO-3, delta is sharded — gather, project, and copy_
+                # all inside GatheredParameters so the reference stays valid.
+                if is_zero3:
+                    import deepspeed
+                    with deepspeed.zero.GatheredParameters([delta], modifier_rank=0):
+                        full_delta = delta.data
+                        projected = full_delta
+                        if U_out.shape[1] > 0:
+                            projected = projected - U_out @ (U_out.T @ projected)
+                        if U_in.shape[1] > 0:
+                            projected = projected - (projected @ U_in) @ U_in.T
+                        full_delta.copy_(projected)
+                else:
+                    full_delta = delta.data
+                    projected = full_delta
+                    if U_out.shape[1] > 0:
+                        projected = projected - U_out @ (U_out.T @ projected)
+                    if U_in.shape[1] > 0:
+                        projected = projected - (projected @ U_in) @ U_in.T
+                    full_delta.copy_(projected)
 
                 folded += 1
                 module.dense_variant.pop(adapter_name, None)
@@ -681,7 +805,11 @@ class CurvatureDenseTrainerMixin:
             output_dir,
             safe_serialization=True,
             is_main_process=self.accelerator.is_main_process,
-            state_dict=state_dict,
+            state_dict=(
+                state_dict
+                if state_dict is not None
+                else self._gather_full_state_dict()
+            ),
         )
 
 

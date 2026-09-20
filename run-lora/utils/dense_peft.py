@@ -114,10 +114,36 @@ class DenseLayer(BaseTunerLayer):
         **kwargs,
     ) -> None:
         base_weight = self.get_base_layer().weight
-        self.dense_delta[adapter_name] = nn.Parameter(
-            base_weight.new_zeros(base_weight.shape), requires_grad=True
+
+        # A ZeRO-3 parameter is commonly exposed as an empty local tensor with
+        # shape (0,), while its logical shape lives in ds_shape.  Never derive
+        # adapter dimensions from the local partition: doing so permanently
+        # creates a zero-sized parameter whose ds_shape is also (0,).
+        logical_shape = (self.out_features, self.in_features)
+        ds_shape = getattr(base_weight, "ds_shape", None)
+        if ds_shape is not None and tuple(ds_shape) != logical_shape:
+            raise ValueError(
+                "Dense base-weight metadata is inconsistent: "
+                f"Linear expects {logical_shape}, ZeRO reports {tuple(ds_shape)}."
+            )
+
+        if base_weight.device.type == "meta":
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+        else:
+            device = base_weight.device
+
+        delta = nn.Parameter(
+            torch.zeros(logical_shape, dtype=base_weight.dtype, device=device),
+            requires_grad=True,
         )
-        self._move_adapter_to_device_of_base_layer(adapter_name)
+
+        self.dense_delta[adapter_name] = delta
+        if base_weight.device.type != "meta":
+            self._move_adapter_to_device_of_base_layer(adapter_name)
         # peft 0.17.1: set_adapter() takes ONLY adapter_names (no inference_mode kwarg)
         self.set_adapter(self.active_adapters)
         # inference_mode is handled by BaseTuner.inject_adapter() after injection
@@ -209,7 +235,9 @@ class DenseLayer(BaseTunerLayer):
                     )
                 else:
                     delta = self.dense_delta[active_adapter]
-                    result = result + F.linear(x.to(delta.dtype), delta).to(result_dtype)
+                    result = result + F.linear(
+                        x.to(delta.dtype), delta
+                    ).to(result_dtype)
             result = result.to(result_dtype)
 
         return result.to(previous_dtype)
@@ -499,17 +527,21 @@ class DensePeftModelForCausalLM:
 
     @staticmethod
     def _find_root_prefix(state_dict: dict[str, torch.Tensor]) -> str:
-        """Discover the root prefix (e.g. "base_model.model.") from state keys."""
-        for key in state_dict:
-            if key.endswith(".base_layer.weight"):
-                # e.g. "base_model.model.layers.0.self_attn.q_proj.base_layer.weight"
-                suffix = ".base_layer.weight"
-                return key[: -len(f".base_layer.weight")].rsplit(".", 1)[0] + "."
-        # Fallback: look for any DenseLinear-containing prefix
-        for key in state_dict:
-            if ".dense_delta." in key:
-                return key[: key.index(".dense_delta.")] + "."
-        return ""
+        """Discover the root prefix (e.g. "model.") from state keys.
+
+        DenseModel wraps a HuggingFace model as ``self.model``, so all
+        state-dict keys are prefixed with ``"model."`` (the DenseModel's
+        attribute name).  The HF model itself may also use ``"model."``
+        as its own internal prefix (e.g. ``model.model.embed_tokens.weight``).
+
+        We must strip ONLY the outermost DenseModel prefix (``"model."``)
+        and preserve the HF model's internal naming (``model.embed_tokens...``)
+        so that vLLM / HuggingFace can reload the weights correctly.
+        """
+        # The DenseModel attribute holding the HF model is always "model".
+        # Every key in DenseModel.state_dict() therefore starts with "model.".
+        # Simply return that fixed prefix.
+        return "model."
 
     @classmethod
     def _merged_base_state_dict(

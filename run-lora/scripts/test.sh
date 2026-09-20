@@ -34,7 +34,7 @@ Options:
                        instruction→ local dir containing IFEval/input_data.jsonl
                      (default: $data_path)
   --task NAME        Task name: metamath, python, commonsense, instruction (default: "$task")
-  --peft NAME        PEFT method: LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT (default: "$peft")
+  --peft NAME        PEFT method: LoRA, CurvatureLoRA, CurvatureDense, CrispEdit, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT, FFT (default: "$peft")
   --rank INT         LoRA rank (default: $rank)
   --bs INT           Inference batch size (default: $bs)
   --output_home PATH Reroute the whole "output" folder to other place (default: $output_home)
@@ -87,16 +87,19 @@ fi
 if [[ ! -d "$output_path" ]]; then
   echo "Error: output_path does not exist: $output_path" >&2; exit 1
 fi
-if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|CurvatureDense|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT)$ ]]; then
-  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, CurvatureDense, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT}." >&2
+if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|CurvatureDense|CrispEdit|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT|FFT)$ ]]; then
+  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, CurvatureDense, CrispEdit, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT, FFT}." >&2
   exit 2
 fi
 
 world_size=$(awk -F',' '{print NF}' <<< "$gpus")
-mod=$(( 32 % world_size ))
-if (( mod != 0 )); then
-  echo "Error: total attention heads (32) is not divisible by num_GPUs ($world_size)" >&2
-  exit 1
+# FFT does not use LoRA, so the 32-heads-divisibility check is irrelevant.
+if [[ "$peft" != "FFT" ]]; then
+  mod=$(( 32 % world_size ))
+  if (( mod != 0 )); then
+    echo "Error: total attention heads (32) is not divisible by num_GPUs ($world_size)" >&2
+    exit 1
+  fi
 fi
 
 # Clean task name (strip sub-task suffix and epoch tag)
@@ -110,7 +113,11 @@ echo "Using output_path: $output_path"
 echo "Using GPUs: $gpus (num_GPUs=$world_size)"
 echo "Using PEFT method: $peft"
 echo "Base model abbr: $model_abbr"
-echo "Task: $task, Rank: $rank"
+if [[ "$peft" == "FFT" ]]; then
+  echo "Task: $task (FFT — no rank)"
+else
+  echo "Task: $task, Rank: $rank"
+fi
 echo "Batch size = $bs"
 echo "================================"
 
@@ -141,6 +148,15 @@ elif [[ "$peft" == "Corda-IPM" ]]; then
 elif [[ "$peft" == "CurvatureDense" ]]; then
   # CurvatureDense saves as a merged full model — load directly without --lora
   base_model="$output_path/adapter_model"
+  lora_path=""
+elif [[ "$peft" == "CrispEdit" ]]; then
+  # CrispEdit saves a complete Hugging Face model — load directly without --lora
+  base_model="$output_path/adapter_model"
+  lora_path=""
+elif [[ "$peft" == "FFT" ]]; then
+  # FFT saves the full model directly to output_path (via safe_save_model_for_hf_trainer).
+  # No adapter_model subfolder; load the full model directly.
+  base_model="$output_path"
   lora_path=""
 else
   # LoRA, CurvatureLoRA, DoRA, GraLoRA, RandLoRA, LoFT — base model with standard adapter

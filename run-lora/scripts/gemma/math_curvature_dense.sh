@@ -29,6 +29,6 @@ peft_methods=("CurvatureDense")
 curvature_energy_ratio=0.7
 
 declare -A peft_lrs
-peft_lrs["CurvatureDense"]="1.1247e-4 2.0000e-4 3.5566e-4 6.3246e-4"
+peft_lrs["CurvatureDense"]="2.0000e-5 3.5566e-5 6.3246e-5 1.1247e-4"
 
 source "$(dirname "${BASH_SOURCE[0]}")/../run_best_common.sh"
