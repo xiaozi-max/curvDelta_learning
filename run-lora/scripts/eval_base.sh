@@ -1,5 +1,5 @@
 #!/bin/bash
-source "common_utils/server_env.sh"
+source "$(git rev-parse --show-toplevel)/common_utils/server_env.sh"
 set -e
 
 # Minimal base-model evaluator (no training).

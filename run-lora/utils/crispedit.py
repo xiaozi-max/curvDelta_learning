@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, SequentialSampler
 from tqdm import tqdm
 from transformers import Trainer, TrainerCallback
 
-from utils.curvature_lora import (
+from utils.curv_lora import (
     CurvatureDataCollator,
     CurvatureTextDataset,
     KFACTracker,

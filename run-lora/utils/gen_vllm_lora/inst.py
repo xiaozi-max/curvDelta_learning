@@ -100,7 +100,10 @@ def main():
 
     if need_cleanup:
         print("Cleaning up temp merged model...")
-        shutil.rmtree(args.temp_path)
+        if os.path.exists(args.temp_path):
+            shutil.rmtree(args.temp_path)
+        else:
+            print(f"Warning: temp path {args.temp_path} already removed, skipping cleanup")
 
 
 if __name__ == '__main__':

@@ -15,10 +15,11 @@ import datasets
 import numpy as np
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel, LoraRuntimeConfig
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-from utils.curvature_lora import CurvatureTrainer, apply_curvature_lora
-from utils.curvature_dense import CurvatureDenseTrainer, get_curvature_dense_model
+from utils.curv_lora import CurvLoRATrainer, apply_curv_lora
+from utils.curv_delta import CurvDeltaTrainer, get_curv_delta_model
 from utils.dense_peft import DenseConfig
 from utils.crispedit import CrispEditTrainer
+from utils.op_lora import OPLoRAFoldCallback, apply_op_lora
 
 IGNORE_INDEX = -100
 logger = logging.getLogger(__name__)
@@ -71,22 +72,25 @@ class TrainingArguments(transformers.TrainingArguments):
     randlora_alpha: int = field(default=None, metadata={"help": "the alpha hyperparameter of RandLoRA \
                                 typically 20 times the rank of the random bases. \
                                 https://github.com/huggingface/peft/blob/758cdac51922abbb24b6e772844c0a88bbe1cd7d/src/peft/tuners/randlora/config.py#L140"})
-    ## CurvatureLoRA
-    use_curvature_lora: Optional[bool] = field(default=False)
+    ## CurvLoRA
+    use_curv_lora: Optional[bool] = field(default=False)
     curvature_data_path: Optional[str] = field(default=None, metadata={"help": "Path to raw-text JSONL curvature anchor set."})
-    curvature_energy_ratio: float = field(default=0.9, metadata={"help": "KFAC top-eigenvector energy ratio for CurvatureLoRA projections."})
-    curvature_collection_batch_size: int = field(default=1, metadata={"help": "Per-device batch size for CurvatureLoRA KFAC/Fisher collection."})
-    curvature_num_chunks: int = field(default=1, metadata={"help": "Number of target-module chunks for CurvatureLoRA KFAC collection."})
+    curvature_energy_ratio: float = field(default=0.9, metadata={"help": "KFAC top-eigenvector energy ratio for CurvLoRA projections."})
+    curvature_collection_batch_size: int = field(default=1, metadata={"help": "Per-device batch size for CurvLoRA KFAC/Fisher collection."})
+    curvature_num_chunks: int = field(default=1, metadata={"help": "Number of target-module chunks for CurvLoRA KFAC collection."})
     curvature_alpha_tr: float = field(default=0.0, metadata={"help": "Trust-region alpha: ||Delta W_eff||_F <= alpha_tr * ||W_base||_F. 0 = disabled."})
     curvature_delta_tr: float = field(default=1e-12, metadata={"help": "Numerical stabilizer for trust-region denominator (must be > 0)."})
-    ## CurvatureDense
-    use_curvature_dense: Optional[bool] = field(default=False)
+    ## CurvDelta
+    use_curv_delta: Optional[bool] = field(default=False)
     ## CrispEdit
     use_crispedit: Optional[bool] = field(default=False)
     crispedit_data_path: Optional[str] = field(default=None, metadata={"help": "Path to FineFineWeb JSONL (field 'text') used for the fixed CrispEdit K-FAC cache."})
     crispedit_energy_ratio: float = field(default=0.9, metadata={"help": "Kronecker-eigenvalue energy ratio for the CrispEdit low-curvature mask."})
     crispedit_collection_batch_size: int = field(default=1, metadata={"help": "Per-device batch size for CrispEdit K-FAC collection."})
     crispedit_num_chunks: int = field(default=1, metadata={"help": "Number of target-module chunks for CrispEdit K-FAC collection."})
+    ## OPLoRA
+    use_op_lora: Optional[bool] = field(default=False)
+    op_lora_k: int = field(default=16, metadata={"help": "Number of top singular directions of W0 protected by OPLoRA."})
         
     # LoRA setting
     target_modules : Optional[str] = field(default="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj")
@@ -318,13 +322,13 @@ def build_model(script_args, checkpoint_dir):
                                               subfolder=script_args.adapter_name_or_path, is_trainable=True)
 
         else:
-            if script_args.use_curvature_dense:
-                # CurvatureDense uses its own DenseModel path — skip LoRA entirely.
+            if script_args.use_curv_delta:
+                # CurvDelta uses its own DenseModel path — skip LoRA entirely.
                 dense_config = DenseConfig(
                     task_type=TaskType.CAUSAL_LM,
                     target_modules=script_args.target_modules.split(','),
                 )
-                model = get_curvature_dense_model(model, dense_config)
+                model = get_curv_delta_model(model, dense_config)
 
             else:
                 if script_args.use_gralora:
@@ -371,8 +375,10 @@ def build_model(script_args, checkpoint_dir):
 
                 model = get_peft_model(model, peft_config)
 
-                if script_args.use_curvature_lora:
-                    model = apply_curvature_lora(model)
+                if script_args.use_curv_lora:
+                    model = apply_curv_lora(model)
+                if script_args.use_op_lora:
+                    model = apply_op_lora(model, k=script_args.op_lora_k)
 
                 if script_args.use_olora:
                     olora_residual_path = os.path.join(script_args.output_dir, "olora_residual_model")
@@ -399,7 +405,7 @@ def build_model(script_args, checkpoint_dir):
         if 'norm' in name or 'gate' in name:
             module = module.to(torch.float32)
 
-    if script_args.local_rank == 0 and not script_args.use_curvature_dense and not script_args.full_finetune and not script_args.use_crispedit:
+    if script_args.local_rank == 0 and not script_args.use_curv_delta and not script_args.full_finetune and not script_args.use_crispedit:
         model.print_trainable_parameters()
 
     return model
@@ -440,27 +446,36 @@ def train():
         logger.info("Load tokenizer from {} over.".format(script_args.model_name_or_path))
 
     resume_from_checkpoint_dir = get_last_checkpoint(script_args.output_dir)
-    if script_args.use_curvature_lora and script_args.use_curvature_dense:
-        raise ValueError("Cannot use both CurvatureLoRA and CurvatureDense simultaneously.")
-    if script_args.use_curvature_lora:
+    if script_args.use_curv_lora and script_args.use_curv_delta:
+        raise ValueError("Cannot use both CurvLoRA and CurvDelta simultaneously.")
+    if script_args.use_op_lora:
+        if script_args.full_finetune or script_args.use_curv_lora or script_args.use_curv_delta or script_args.use_crispedit or script_args.use_dora:
+            raise ValueError("OPLoRA cannot be combined with FFT/CurvLoRA/CurvDelta/CrispEdit/DoRA.")
         if resume_from_checkpoint_dir is not None:
-            raise ValueError("CurvatureLoRA does not support resuming from unfinished checkpoints.")
-        if script_args.curvature_data_path is None:
-            raise ValueError("--curvature_data_path is required when --use_curvature_lora True.")
+            raise ValueError("OPLoRA does not support resuming from unfinished checkpoints.")
+        if script_args.op_lora_k <= 0:
+            raise ValueError("--op_lora_k must be a positive integer.")
         if str(script_args.save_strategy).lower().split(".")[-1] != "no":
-            raise ValueError("CurvatureLoRA requires --save_strategy no; only the final folded adapter is saved.")
-    if script_args.use_curvature_dense:
+            raise ValueError("OPLoRA requires --save_strategy no; only the final folded adapter is saved.")
+    if script_args.use_curv_lora:
         if resume_from_checkpoint_dir is not None:
-            raise ValueError("CurvatureDense does not support resuming from unfinished checkpoints.")
+            raise ValueError("CurvLoRA does not support resuming from unfinished checkpoints.")
         if script_args.curvature_data_path is None:
-            raise ValueError("--curvature_data_path is required when --use_curvature_dense True.")
+            raise ValueError("--curvature_data_path is required when --use_curv_lora True.")
         if str(script_args.save_strategy).lower().split(".")[-1] != "no":
-            raise ValueError("CurvatureDense requires --save_strategy no; only the final folded model is saved.")
+            raise ValueError("CurvLoRA requires --save_strategy no; only the final folded adapter is saved.")
+    if script_args.use_curv_delta:
+        if resume_from_checkpoint_dir is not None:
+            raise ValueError("CurvDelta does not support resuming from unfinished checkpoints.")
+        if script_args.curvature_data_path is None:
+            raise ValueError("--curvature_data_path is required when --use_curv_delta True.")
+        if str(script_args.save_strategy).lower().split(".")[-1] != "no":
+            raise ValueError("CurvDelta requires --save_strategy no; only the final folded model is saved.")
     if script_args.use_crispedit:
         if script_args.full_finetune or script_args.bits not in [16, 32]:
             raise ValueError("CrispEdit trains base projection weights in place: requires --full_finetune False and --bits 16/32.")
-        if script_args.use_curvature_lora or script_args.use_curvature_dense or script_args.use_loft:
-            raise ValueError("CrispEdit cannot be combined with CurvatureLoRA/CurvatureDense/LoFT.")
+        if script_args.use_curv_lora or script_args.use_curv_delta or script_args.use_loft:
+            raise ValueError("CrispEdit cannot be combined with CurvLoRA/CurvDelta/LoFT.")
         if resume_from_checkpoint_dir is not None:
             raise ValueError("CrispEdit does not support resuming from unfinished checkpoints.")
         if script_args.crispedit_data_path is None:
@@ -575,10 +590,10 @@ def train():
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     data_module = dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
-    if script_args.use_curvature_lora:
+    if script_args.use_curv_lora:
         if script_args.use_loft:
-            raise ValueError("CurvatureLoRA cannot be combined with LoFT optimizer mode.")
-        trainer = CurvatureTrainer(
+            raise ValueError("CurvLoRA cannot be combined with LoFT optimizer mode.")
+        trainer = CurvLoRATrainer(
             model=model,
             tokenizer=tokenizer,
             args=script_args,
@@ -590,10 +605,10 @@ def train():
             curvature_delta_tr=script_args.curvature_delta_tr,
             **data_module,
         )
-    elif script_args.use_curvature_dense:
+    elif script_args.use_curv_delta:
         if script_args.use_loft:
-            raise ValueError("CurvatureDense cannot be combined with LoFT optimizer mode.")
-        trainer = CurvatureDenseTrainer(
+            raise ValueError("CurvDelta cannot be combined with LoFT optimizer mode.")
+        trainer = CurvDeltaTrainer(
             model=model,
             tokenizer=tokenizer,
             args=script_args,
@@ -631,7 +646,9 @@ def train():
     #     trainer = Trainer(model=model, processing_class=tokenizer, args=script_args, **data_module)
     else:
         trainer = Trainer(model=model, tokenizer=tokenizer, args=script_args, **data_module)
-    if not script_args.full_finetune and not script_args.use_curvature_dense and not script_args.use_crispedit:
+    if script_args.use_op_lora:
+        trainer.add_callback(OPLoRAFoldCallback())
+    if not script_args.full_finetune and not script_args.use_curv_delta and not script_args.use_crispedit:
         trainer.add_callback(SavePeftModelCallback(tokenizer))
     trainer.train(resume_from_checkpoint=resume_from_checkpoint_dir)
     trainer.save_state()

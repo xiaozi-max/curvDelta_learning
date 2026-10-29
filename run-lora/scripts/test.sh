@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source "common_utils/server_env.sh"
+source "$(git rev-parse --show-toplevel)/common_utils/server_env.sh"
 
 # =====================
 # default values
@@ -34,7 +34,7 @@ Options:
                        instruction→ local dir containing IFEval/input_data.jsonl
                      (default: $data_path)
   --task NAME        Task name: metamath, python, commonsense, instruction (default: "$task")
-  --peft NAME        PEFT method: LoRA, CurvatureLoRA, CurvatureDense, CrispEdit, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT, FFT (default: "$peft")
+  --peft NAME        PEFT method: LoRA, CurvLoRA, CurvDelta, CrispEdit, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT, FFT, OPLoRA (default: "$peft")
   --rank INT         LoRA rank (default: $rank)
   --bs INT           Inference batch size (default: $bs)
   --output_home PATH Reroute the whole "output" folder to other place (default: $output_home)
@@ -87,8 +87,8 @@ fi
 if [[ ! -d "$output_path" ]]; then
   echo "Error: output_path does not exist: $output_path" >&2; exit 1
 fi
-if [[ ! "$peft" =~ ^(LoRA|CurvatureLoRA|CurvatureDense|CrispEdit|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT|FFT)$ ]]; then
-  echo "Error: --peft must be one of {LoRA, CurvatureLoRA, CurvatureDense, CrispEdit, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT, FFT}." >&2
+if [[ ! "$peft" =~ ^(LoRA|CurvLoRA|CurvDelta|CrispEdit|Corda-KPM|Corda-IPM|PiSSA|MiLoRA|DoRA|OLoRA|InitAB|LoRA-GA|GraLoRA|RandLoRA|LoFT|FFT|OPLoRA)$ ]]; then
+  echo "Error: --peft must be one of {LoRA, CurvLoRA, CurvDelta, CrispEdit, Corda-KPM, Corda-IPM, PiSSA, MiLoRA, DoRA, OLoRA, InitAB, LoRA-GA, GraLoRA, RandLoRA, LoFT, FFT, OPLoRA}." >&2
   exit 2
 fi
 
@@ -145,8 +145,8 @@ elif [[ "$peft" == "Corda-KPM" ]]; then
   base_model=$(readlink -m "${output_home}/output/Corda-KPM-${model_abbr}-r${rank}-${task}")
 elif [[ "$peft" == "Corda-IPM" ]]; then
   base_model=$(readlink -m "${output_home}/output/Corda-IPM-${model_abbr}-r${rank}-${task}")
-elif [[ "$peft" == "CurvatureDense" ]]; then
-  # CurvatureDense saves as a merged full model — load directly without --lora
+elif [[ "$peft" == "CurvDelta" ]]; then
+  # CurvDelta saves as a merged full model — load directly without --lora
   base_model="$output_path/adapter_model"
   lora_path=""
 elif [[ "$peft" == "CrispEdit" ]]; then
@@ -159,7 +159,7 @@ elif [[ "$peft" == "FFT" ]]; then
   base_model="$output_path"
   lora_path=""
 else
-  # LoRA, CurvatureLoRA, DoRA, GraLoRA, RandLoRA, LoFT — base model with standard adapter
+  # LoRA, CurvLoRA, DoRA, GraLoRA, RandLoRA, LoFT, OPLoRA — base model with standard adapter
   base_model="$model"
 fi
 

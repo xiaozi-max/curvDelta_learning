@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Save local NQ-open question-only samples for Corda KPM and CurvatureLoRA calibration.
+Save local NQ-open question-only samples for Corda KPM and CurvLoRA calibration.
 
 Output contains only questions (no answers), safe for KFAC/Fisher collection.
 FineFineWeb is the preferred calibration data source; this script provides

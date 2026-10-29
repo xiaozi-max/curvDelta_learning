@@ -30,6 +30,11 @@ def extract_hyperparams_from_folder_name(folder_name):
     if trial_match:
         trial_num = int(trial_match.group(1))
 
+    # Replay runs carry a "-replay" suffix on the subfolder; tag them so they
+    # aggregate as separate records instead of merging into the plain run.
+    if "replay" in folder_name:
+        hyperparam["replay"] = True
+
     return hyperparam, trial_num
 
 
@@ -110,32 +115,52 @@ def main():
             if not hyperparam:
                 continue
 
+            # Read world_knowledge.json independently (not reliant on perf.json)
+            wk_data = None
+            wk_file = sub_folder / 'world_knowledge.json'
+            if wk_file.exists():
+                with open(wk_file, 'r', encoding='utf-8') as f:
+                    wk_data = json.load(f)
+                print(f"  Found world_knowledge.json in {sub_folder.name}")
+
+            # perf.json is the main source; if absent, fall back to WK-only record
             perf_file = sub_folder / 'perf.json'
             if not perf_file.exists():
-                continue
-
-            try:
+                if wk_data is not None:
+                    perf_data = {"world_knowledge": wk_data}
+                else:
+                    continue
+            else:
                 with open(perf_file, 'r', encoding='utf-8') as f:
                     perf_data = json.load(f)
+                if wk_data is not None:
+                    perf_data['world_knowledge'] = wk_data
 
+            try:
                 existing_list = data[args.task].setdefault(method, [])
                 new_hyparam = {**hyperparam, 'rank': rank, 'epoch': epoch}
                 acc_key = f'acc-{trial_num}'
 
-                is_duplicate = any(
-                    r.get('hyparam') == new_hyparam and acc_key in r
-                    for r in existing_list
+                # Try to find an existing record with the same hyperparams
+                existing_record = next(
+                    (r for r in existing_list if r.get('hyparam') == new_hyparam and acc_key in r),
+                    None
                 )
 
-                if not is_duplicate:
+                if existing_record is not None:
+                    # Merge new fields into the existing record (incremental update)
+                    old_data = existing_record[acc_key]
+                    for new_key, new_val in perf_data.items():
+                        if new_key not in old_data or old_data[new_key] is None:
+                            old_data[new_key] = new_val
+                    print(f"Updated: {sub_folder.name}")
+                else:
                     record = {
                         'hyparam': new_hyparam,
                         acc_key: perf_data,
                     }
                     existing_list.append(record)
                     print(f"Added: {sub_folder.name}")
-                else:
-                    print(f"Already exists, skipping: {sub_folder.name}")
 
             except Exception as e:
                 print(f"Error reading {perf_file}: {e}")

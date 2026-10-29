@@ -20,7 +20,7 @@ TASK_METRIC_PREFERENCES = {
 # For these methods, --lora points to a complete model directory with
 # config.json + model.safetensors that can be used directly.
 FULL_MODEL_PEFT_METHODS = {
-    "CurvatureDense",
+    "CurvDelta",
     "CrispEdit",
     "FFT",
 }
@@ -195,7 +195,7 @@ def run_lm_eval(model_path, tasks, gpus, batch_size, limit):
         "dtype=auto,"
         "gpu_memory_utilization=0.7,"
         "max_model_len=2048,"
-        "max_num_seqs=8"
+        "max_num_seqs=4"
     )
     print(f"[WK] Running lm_eval tasks={tasks}, limit={limit}, batch_size={batch_size}")
     return lm_eval.simple_evaluate(
@@ -249,7 +249,7 @@ def main():
         print(f"[WK] Tasks:      {tasks}")
 
         if args.peft in FULL_MODEL_PEFT_METHODS:
-            # CurvatureDense / FFT: adapter_model is already a full
+            # CurvDelta / FFT: adapter_model is already a full
             # HF model. Use it directly without any merge step.
             print(f"[WK] {args.peft}: using pre-merged model directly from {args.lora}")
             eval_model_path = args.lora

@@ -1,15 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-source "common_utils/server_env.sh"
+source "$(git rev-parse --show-toplevel)/common_utils/server_env.sh"
 set -e
 
-# Runtime defaults mirror the corresponding non-best script.
 output_home="./"
-master_port=16927
+master_port=17025
 model="${ROOT_DIR}/models/meta-llama/Llama-2-7b-hf"
 model_abbr="Llama-2-7b"
 
-# Grab 2 GPUs for large models (7B)
 grab_gpus 2 40000 100 3
 train_gpus="$CUDA_VISIBLE_DEVICES"
 test_gpus="$CUDA_VISIBLE_DEVICES"
@@ -20,16 +18,17 @@ run_world_knowledge=true
 world_knowledge_limit=100
 model_max_length=512
 
-# Paper-best configuration: Llama math, Table 10.
 seeds=(1)
 rank=32
 bs=16
 task="metamath"
 peft_methods=("LoRA" "PiSSA" "MiLoRA")
+curvature_energy_ratio=0.7
 
 declare -A peft_lrs
-peft_lrs["LoRA"]="6.3246e-4"
-peft_lrs["PiSSA"]="1.1247e-4"
-peft_lrs["MiLoRA"]="3.5566e-4"
+peft_lrs["LoRA"]="1.1247e-5 2.0000e-5 3.5566e-5 6.3246e-5 1.1247e-4 2.0000e-4 3.5566e-4 6.3246e-4"
+peft_lrs["PiSSA"]="1.1247e-5 2.0000e-5 3.5566e-5 6.3246e-5 1.1247e-4 2.0000e-4 3.5566e-4 6.3246e-4"
+peft_lrs["MiLoRA"]="1.1247e-5 2.0000e-5 3.5566e-5 6.3246e-5 1.1247e-4 2.0000e-4 3.5566e-4 6.3246e-4"
 
 source "$(dirname "${BASH_SOURCE[0]}")/../run_best_common.sh"
+

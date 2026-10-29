@@ -58,6 +58,7 @@ def load_data(json_path, task, min_lr=None, max_lr=None, default_lr_only=True):
         'dora':    'DoRA',
         'initab':  'InitAB',
         'lora-ga': 'LoRA-GA',
+        'oplora':  'OPLoRA',
     }
 
     series = {}
@@ -130,6 +131,19 @@ def load_data(json_path, task, min_lr=None, max_lr=None, default_lr_only=True):
 
                     else:
                         acc = 0.0
+
+                    # World knowledge subtasks (always extracted when present)
+                    wk_data = v.get('world_knowledge')
+                    if isinstance(wk_data, dict):
+                        wk_vals = []
+                        for wk_task, wk_score in wk_data.items():
+                            if wk_score is not None:
+                                breakdown_data[label][lr].setdefault(wk_task, []).append(wk_score)
+                                wk_vals.append(wk_score)
+                        if wk_vals:
+                            breakdown_data[label][lr].setdefault('WK-Avg', []).append(
+                                sum(wk_vals) / len(wk_vals)
+                            )
 
                     lr_acc_dict.setdefault(lr, []).append((trial_num, acc))
 
@@ -240,6 +254,44 @@ def print_per_lr_table(series: dict):
             print(f"{lr:>12.2e} | {_fmt_pct(means[idx]):>10} | {_fmt_pct(stds[idx]):>10} | {_fmt_pct_list(run_vals)}")
 
 
+WK_TASKS = ['triviaqa', 'nq_open', 'webqs']
+
+
+def print_world_knowledge_breakdown(breakdown_data):
+    """Print world knowledge subtask breakdown if data exists."""
+    has_wk = any(
+        any(wk in lr_data for lr_data in method_data.values())
+        for method_data in breakdown_data.values()
+        for wk in WK_TASKS
+    )
+    if not has_wk:
+        return
+
+    all_wk_tasks = ['WK-Avg'] + WK_TASKS
+
+    for st in all_wk_tasks:
+        print("\n" + "=" * 70)
+        print(f"WORLD KNOWLEDGE: {st}")
+        print("=" * 70)
+
+        for method, lr_data in breakdown_data.items():
+            has_any = any(st in d for d in lr_data.values())
+            if not has_any:
+                continue
+            print(f"\n[{method}]")
+            print(f"{'LR':>12} | {'Mean':>10} | {'StdDev':>10} | Runs")
+            print("-" * 70)
+            for lr in sorted(lr_data.keys()):
+                vals = lr_data[lr].get(st, [])
+                if vals:
+                    arr  = np.array(vals)
+                    mean = arr.mean()
+                    std  = arr.std(ddof=1) if len(vals) > 1 else 0.0
+                    print(f"{lr:>12.2e} | {_fmt_pct(mean):>10} | {_fmt_pct(std):>10} | {_fmt_pct_list(vals)}")
+                else:
+                    print(f"{lr:>12.2e} | {'N/A':>10} | {'N/A':>10} | []")
+
+
 def main():
     args = parse_arguments()
     args.min_lr, args.max_lr = normalize_lr_bounds(args.min_lr, args.max_lr)
@@ -268,6 +320,8 @@ def main():
 
     if task in ('metamath', 'python', 'instruction'):
         print_subtask_breakdown(breakdown_data)
+
+    print_world_knowledge_breakdown(breakdown_data)
 
     print_per_lr_table(series)
 

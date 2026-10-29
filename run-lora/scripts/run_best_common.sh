@@ -45,12 +45,12 @@ for seed in "${seeds[@]}"; do
         _replay_suffix="-replay"
       fi
       _er_suffix=""
-      if [[ "$peft" == "CurvatureLoRA" || "$peft" == "CurvatureDense" ]]; then
+      if [[ "$peft" == "CurvLoRA" || "$peft" == "CurvDelta" ]]; then
         _er_suffix="-er${curvature_energy_ratio//./}"
         if [[ "${curvature_lr_scheduler:-cosine}" == "constant_with_warmup" ]]; then
           _er_suffix="${_er_suffix}-cww"
         fi
-        if [[ "$peft" == "CurvatureLoRA" ]]; then
+        if [[ "$peft" == "CurvLoRA" ]]; then
           _tr_alpha="${curvature_alpha_tr:-0.0}"
           if [[ "$_tr_alpha" != "0.0" && "$_tr_alpha" != "0" ]]; then
             _tr_suffix="-tr${_tr_alpha//./}"
@@ -60,6 +60,9 @@ for seed in "${seeds[@]}"; do
       fi
       if [[ "$peft" == "CrispEdit" ]]; then
         _er_suffix="-er${crispedit_energy_ratio//./}"
+      fi
+      if [[ "$peft" == "OPLoRA" ]]; then
+        _er_suffix="-k${op_lora_k:-16}"
       fi
       if [[ "$peft" == "FFT" ]]; then
         # FFT: no rank, output_path = output/{task}-FFT-{model_abbr}/bs{bs}-lr{lr}-trial{seed}
@@ -133,7 +136,8 @@ for seed in "${seeds[@]}"; do
             --crispedit_energy_ratio "${crispedit_energy_ratio:-0.9}" \
             --crispedit_num_chunks "${crispedit_num_chunks:-1}" \
             --replay_data_path "$replay_data_path" \
-            --replay_num_samples "$replay_num_samples"
+            --replay_num_samples "$replay_num_samples" \
+            --op_lora_k "${op_lora_k:-16}"
         fi
 
         echo ">>> Start Testing, performance will be saved at $perf_json_path"

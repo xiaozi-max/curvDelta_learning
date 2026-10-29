@@ -9,7 +9,7 @@ huggingface-cli download --repo-type dataset --resume-download fxmeng/pissa-data
     --include "metamath/*" "python/*" \
     --local-dir ./lora-dataset/pissa-dataset
 
-# NQ-open calibration data for CorDA-KPM and CurvatureLoRA.
+# NQ-open calibration data for CorDA-KPM and CurvLoRA.
 python3 utils/save_nq_open.py
 
 # 2. Commonsense Reasoning (LLM-Adapters)
